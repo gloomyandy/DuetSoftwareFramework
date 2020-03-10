@@ -28,7 +28,7 @@ namespace LinuxDevices
                 throw new IOException($"Error {Marshal.GetLastWin32Error()}. Can not open SPI device file '{devNode}'.");
             }
 
-            UnixSpiMode mode = UnixSpiMode.SPI_MODE_0;
+            UnixSpiMode mode = UnixSpiMode.SPI_MODE_3;
             IntPtr nativePtr = new IntPtr(&mode);
 
             int result = Interop.ioctl(_deviceFileDescriptor, (uint)SpiSettings.SPI_IOC_WR_MODE, nativePtr);

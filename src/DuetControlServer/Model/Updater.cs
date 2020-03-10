@@ -149,12 +149,13 @@ namespace DuetControlServer.Model
             using (await Provider.AccessReadWriteAsync())
             {
                 // - Electronics -
-                Provider.Get.Electronics.McuTemp.Current = response.mcutemp.cur;
-                Provider.Get.Electronics.McuTemp.Min = response.mcutemp.min;
-                Provider.Get.Electronics.McuTemp.Max = response.mcutemp.max;
-                Provider.Get.Electronics.VIn.Current = response.vin.cur;
-                Provider.Get.Electronics.VIn.Min = response.vin.min;
-                Provider.Get.Electronics.VIn.Max = response.vin.max;
+		// Not available from LPC boards
+                //Provider.Get.Electronics.McuTemp.Current = response.mcutemp.cur;
+		//Provider.Get.Electronics.McuTemp.Min = response.mcutemp.min;
+                //Provider.Get.Electronics.McuTemp.Max = response.mcutemp.max;
+                //Provider.Get.Electronics.VIn.Current = response.vin.cur;
+                //Provider.Get.Electronics.VIn.Min = response.vin.min;
+                //Provider.Get.Electronics.VIn.Max = response.vin.max;
 
                 // - Fans -
                 for (int fan = 0; fan < response.@params.fanPercent.Count; fan++)
