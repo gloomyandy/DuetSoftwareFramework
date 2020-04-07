@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DuetAPI;
@@ -25,30 +26,66 @@ namespace DuetControlServer.Commands
 
         #region Code Scheduling
         /// <summary>
+        /// Internal type of a code. This reflects the priority as well
+        /// </summary>
+        private enum InternalCodeType : int
+        {
+            /// <summary>
+            /// Regular G/M/T-code
+            /// </summary>
+            Regular = 0,
+
+            /// <summary>
+            /// Inserted code from an intercepting connection
+            /// </summary>
+            Inserted = 1,
+
+            /// <summary>
+            /// Code from a macro file
+            /// </summary>
+            Macro = 2,
+
+            /// <summary>
+            /// Inserted macro code from an intercepting connection
+            /// </summary>
+            InsertedFromMacro = 3,
+
+            /// <summary>
+            /// Code being executed while an acknowledgemenet is awaited
+            /// </summary>
+            BlockingRegular = 4,
+
+            /// <summary>
+            /// Code with <see cref="CodeFlags.IsPrioritized"/> set
+            /// </summary>
+            Prioritized = 5
+        }
+
+        /// <summary>
         /// Array of AsyncLocks to guarantee the ordered start of incoming G/M/T-codes
         /// </summary>
         /// <remarks>
         /// AsyncLock implements an internal waiter queue, so it is safe to rely on it for
         /// maintaining the right order of codes being executed per code channel
         /// </remarks>
-        private static readonly AsyncLock[,] _codeStartLocks = new AsyncLock[Channels.Total, Enum.GetValues(typeof(InternalCodeType)).Length];
+        private static readonly AsyncLock[,] _codeStartLocks = new AsyncLock[Inputs.Total, Enum.GetValues(typeof(InternalCodeType)).Length];
 
         /// <summary>
         /// Array of AsyncLocks to guarantee the ordered finishing of G/M/T-codes
         /// </summary>
-        private static readonly AsyncLock[,] _codeFinishLocks = new AsyncLock[Channels.Total, Enum.GetValues(typeof(InternalCodeType)).Length];
+        private static readonly AsyncLock[,] _codeFinishLocks = new AsyncLock[Inputs.Total, Enum.GetValues(typeof(InternalCodeType)).Length];
 
         /// <summary>
         /// List of cancellation tokens to cancel pending codes while they are waiting for their execution
         /// </summary>
-        private static readonly CancellationTokenSource[] _cancellationTokenSources = new CancellationTokenSource[Channels.Total];
+        private static readonly CancellationTokenSource[] _cancellationTokenSources = new CancellationTokenSource[Inputs.Total];
 
         /// <summary>
         /// Initialize the code scheduler
         /// </summary>
         public static void Init()
         {
-            for (int i = 0; i < Channels.Total; i++)
+            for (int i = 0; i < Inputs.Total; i++)
             {
                 foreach (InternalCodeType codeType in Enum.GetValues(typeof(InternalCodeType)))
                 {
@@ -77,37 +114,6 @@ namespace DuetControlServer.Commands
                 // Create a new one
                 _cancellationTokenSources[(int)channel] = new CancellationTokenSource();
             }
-        }
-
-        /// <summary>
-        /// Internal type of a code. This reflects the priority as well
-        /// </summary>
-        private enum InternalCodeType : int
-        {
-            /// <summary>
-            /// Regular G/M/T-code
-            /// </summary>
-            Regular = 0,
-
-            /// <summary>
-            /// Inserted code from an intercepting connection
-            /// </summary>
-            Inserted = 1,
-
-            /// <summary>
-            /// Code from a macro file
-            /// </summary>
-            Macro = 2,
-
-            /// <summary>
-            /// Inserted macro code from an intercepting connection
-            /// </summary>
-            InsertedFromMacro = 3,
-
-            /// <summary>
-            /// Code with <see cref="CodeFlags.IsPrioritized"/> set
-            /// </summary>
-            Prioritized = 4
         }
 
         /// <summary>
@@ -168,6 +174,11 @@ namespace DuetControlServer.Commands
                 _codeType = InternalCodeType.Macro;
                 _logger.Debug("Waiting for execution of {0} (macro code)", this);
             }
+            else if (!Flags.HasFlag(CodeFlags.IsFromFirmware) && SPI.Interface.IsWaitingForAcknowledgement(Channel))
+            {
+                _codeType = InternalCodeType.BlockingRegular;
+                _logger.Debug("Waiting for execution of {0} (acknowledgement)", this);
+            }
             else
             {
                 _codeType = InternalCodeType.Regular;
@@ -224,12 +235,12 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Lock around the files being written
         /// </summary>
-        public static AsyncLock[] FileLocks = new AsyncLock[Channels.Total];
+        public static AsyncLock[] FileLocks = new AsyncLock[Inputs.Total];
 
         /// <summary>
         /// Current stream writer of the files being written to (M28/M29)
         /// </summary>
-        public static StreamWriter[] FilesBeingWritten = new StreamWriter[Channels.Total];
+        public static StreamWriter[] FilesBeingWritten = new StreamWriter[Inputs.Total];
 
         /// <summary>
         /// Constructor of a new code
@@ -249,7 +260,7 @@ namespace DuetControlServer.Commands
         {
             using (await Model.Provider.AccessReadOnlyAsync())
             {
-                Compatibility compatibility = Model.Provider.Get.Channels[Channel].Compatibility;
+                Compatibility compatibility = Model.Provider.Get.Inputs[Channel].Compatibility;
                 return compatibility == Compatibility.Marlin || compatibility == Compatibility.NanoDLP;
             }
         }
@@ -379,9 +390,9 @@ namespace DuetControlServer.Commands
             Task<CodeResult> rrfTask;
             if (Channel == CodeChannel.File)
             {
-                using (await FileExecution.Print.LockAsync())
+                using (await FileExecution.Job.LockAsync())
                 {
-                    if (FileExecution.Print.IsPaused)
+                    if (FileExecution.Job.IsPaused)
                     {
                         throw new OperationCanceledException();
                     }
@@ -430,6 +441,49 @@ namespace DuetControlServer.Commands
                     ResolvedByInterceptor = InternallyProcessed = true;
                     return true;
                 }
+            }
+
+            // Evaluate echo commands
+            if (Keyword == KeywordType.Echo)
+            {
+                await Interface.Flush(this);
+
+                StringBuilder builder = new StringBuilder();
+                foreach (string expression in KeywordArgument.Split(','))
+                {
+                    string trimmedExpression = expression.Trim();
+                    try
+                    {
+                        // FIXME This should only replace Linux expressions after Pre and perform the final evaluation after Post
+                        bool expressionFound;
+                        object expressionResult;
+                        using (await Model.Provider.AccessReadOnlyAsync())
+                        {
+                            expressionFound = Model.Filter.GetSpecific(trimmedExpression, true, out expressionResult);
+                        }
+                        if (!expressionFound)
+                        {
+                            expressionResult = await Interface.EvaluateExpression(Channel, trimmedExpression);
+                        }
+
+                        if (builder.Length != 0)
+                        {
+                            builder.Append(' ');
+                        }
+                        builder.Append(expressionResult);
+                    }
+                    catch (CodeParserException e)
+                    {
+                        Result = new CodeResult(MessageType.Error, $"Failed to evaluate \"{trimmedExpression}\": {e.Message}");
+                        return true;
+                    }
+                }
+                Result = new CodeResult(MessageType.Success, builder.ToString());
+                return true;
+            }
+            else if (Keyword != KeywordType.None)
+            {
+                throw new NotSupportedException();
             }
 
             // Attempt to process the code internally
@@ -498,9 +552,8 @@ namespace DuetControlServer.Commands
                             break;
                     }
 
-                    // RepRapFirmware generally prefixes error messages with the code itself.
-                    // Do this only for error messages that originate either from a print or from a macro file
-                    if (Flags.HasFlag(CodeFlags.IsFromMacro) || Channel == CodeChannel.File)
+                    // RepRapFirmware generally prefixes error messages with the code itself
+                    if (!Flags.HasFlag(CodeFlags.IsPostProcessed))
                     {
                         foreach (Message msg in Result)
                         {
@@ -512,31 +565,42 @@ namespace DuetControlServer.Commands
                     }
 
                     // Deal with firmware emulation
-                    if (!Flags.HasFlag(CodeFlags.IsFromMacro) && await EmulatingMarlin())
+                    if (!Flags.HasFlag(CodeFlags.IsFromMacro))
                     {
-                        if (Result.Count != 0 && Type == CodeType.MCode && MajorNumber == 105)
+                        if (await EmulatingMarlin())
                         {
-                            Result[0].Content = "ok " + Result[0].Content;
+                            if (Result.Count != 0 && Type == CodeType.MCode && MajorNumber == 105)
+                            {
+                                Result[0].Content = "ok " + Result[0].Content;
+                            }
+                            else if (Result.IsEmpty)
+                            {
+                                Result.Add(MessageType.Success, "ok\n");
+                            }
+                            else
+                            {
+                                Result[^1].Content += "\nok\n";
+                            }
                         }
-                        else if (Result.IsEmpty)
+                        else if (!Result.IsEmpty)
                         {
-                            Result.Add(MessageType.Success, "ok\n");
+                            Result[^1].Content += "\n";
                         }
                         else
                         {
-                            Result[^1].Content += "\nok\n";
+                            Result.Add(MessageType.Success, "\n");
                         }
                     }
                 }
 
-                // Log warning and error replies after the code has been processed internally
-                if (InternallyProcessed)
+                // Log our own warnings and errors
+                if (!Flags.HasFlag(CodeFlags.IsPostProcessed) && Channel != CodeChannel.File)
                 {
                     foreach (Message msg in Result)
                     {
-                        if (msg.Type != MessageType.Success && Channel != CodeChannel.File)
+                        if (msg.Type != MessageType.Success)
                         {
-                            // When a file is being printed, the message is output and logged
+                            // When a file is being printed, every message is automatically output and logged
                             await Utility.Logger.Log(msg);
                         }
                     }

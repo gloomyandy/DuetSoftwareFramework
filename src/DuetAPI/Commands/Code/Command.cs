@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -51,7 +52,7 @@ namespace DuetAPI.Commands
         /// <summary>
         /// Code channel to send this code to
         /// </summary>
-        public CodeChannel Channel { get; set; } = Defaults.Channel;
+        public CodeChannel Channel { get; set; } = Defaults.InputChannel;
 
         /// <summary>
         /// Line number of this code
@@ -121,7 +122,7 @@ namespace DuetAPI.Commands
         {
             Result = null;
             Type = CodeType.Comment;
-            Channel = Defaults.Channel;
+            Channel = Defaults.InputChannel;
             if (!keepLineNumber)
             {
                 LineNumber = null;
@@ -198,6 +199,24 @@ namespace DuetAPI.Commands
         /// <returns>Reconstructed code string</returns>
         public override string ToString()
         {
+            if (Keyword != KeywordType.None)
+            {
+                return Keyword switch
+                {
+                    KeywordType.Abort => "abort " + KeywordArgument,
+                    KeywordType.Break => "break",
+                    KeywordType.Echo => "echo " + KeywordArgument,
+                    KeywordType.Else => "else",
+                    KeywordType.ElseIf => "elif " + KeywordArgument,
+                    KeywordType.If => "if " + KeywordArgument,
+                    KeywordType.Return => "return " + KeywordArgument,
+                    KeywordType.Set => "set " + KeywordArgument,
+                    KeywordType.Var => "var " + KeywordArgument,
+                    KeywordType.While => "while " + KeywordArgument,
+                    _ => throw new NotImplementedException()
+                };
+            }
+
             if (Type == CodeType.Comment)
             {
                 return ";" + Comment;
@@ -238,6 +257,10 @@ namespace DuetAPI.Commands
             // Then the comment is appended (if applicable)
             if (!string.IsNullOrEmpty(Comment))
             {
+                if (builder.Length > 0)
+                {
+                    builder.Append(' ');
+                }
                 builder.Append(';');
                 builder.Append(Comment);
             }
@@ -263,9 +286,9 @@ namespace DuetAPI.Commands
                 return "(comment)";
             }
 
-            if (MajorNumber.HasValue)
+            if (MajorNumber != null)
             {
-                if (MinorNumber.HasValue)
+                if (MinorNumber != null)
                 {
                     return $"{(char)Type}{MajorNumber}.{MinorNumber}";
                 }

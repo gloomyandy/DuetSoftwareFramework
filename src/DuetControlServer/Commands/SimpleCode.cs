@@ -1,5 +1,5 @@
-﻿using DuetAPI;
-using DuetAPI.Commands;
+﻿using DuetAPI.Commands;
+using DuetAPI.Machine;
 using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
@@ -17,14 +17,14 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Locks to avoid race conditions when executing multiple text-based codes via the same channel
         /// </summary>
-        private static readonly AsyncLock[] _channelLocks = new AsyncLock[DuetAPI.Machine.Channels.Total];
+        private static readonly AsyncLock[] _channelLocks = new AsyncLock[Inputs.Total];
 
         /// <summary>
         /// Initialize this class
         /// </summary>
         public static void Init()
         {
-            for (int i = 0; i < DuetAPI.Machine.Channels.Total; i++)
+            for (int i = 0; i < Inputs.Total; i++)
             {
                 _channelLocks[i] = new AsyncLock();
             }
@@ -106,15 +106,21 @@ namespace DuetControlServer.Commands
                 // Execute normal codes next. Use a lock here because multiple codes may be queued for the same channel
                 if (codes.Count > 0)
                 {
-                    using (await _channelLocks[(int)Channel].LockAsync())
+                    Task<CodeResult>[] codeTasks = new Task<CodeResult>[codes.Count];
+                    using (await _channelLocks[(int)Channel].LockAsync(Program.CancellationToken))
                     {
-                        foreach (Code code in codes)
+                        for (int i = 0; i < codes.Count; i++)
                         {
-                            CodeResult codeResult = await code.Execute();
-                            if (codeResult != null)
-                            {
-                                result.AddRange(codeResult);
-                            }
+                            codeTasks[i] = codes[i].Execute();
+                        }
+                    }
+
+                    foreach (Task<CodeResult> codeTask in codeTasks)
+                    {
+                        CodeResult codeResult = await codeTask;
+                        if (codeResult != null)
+                        {
+                            result.AddRange(codeResult);
                         }
                     }
                 }

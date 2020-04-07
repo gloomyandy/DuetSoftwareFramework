@@ -1,5 +1,5 @@
 ﻿using DuetAPI.Commands;
-using DuetControlServer.FileExecution;
+using DuetControlServer.Files;
 using NUnit.Framework;
 using System;
 using System.IO;
@@ -12,7 +12,7 @@ namespace UnitTests.File
         [Test]
         public void ProcessConfig()
         {
-            string filePath = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "File/GCodes/config.g");
+            string filePath = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "../../../File/GCodes/config.g");
             MacroFile macro = new MacroFile(filePath, DuetAPI.CodeChannel.Trigger, null);
 
             do

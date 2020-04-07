@@ -1,7 +1,8 @@
 ﻿using DuetAPI;
 using DuetAPI.Commands;
-using DuetControlServer.FileExecution;
-using DuetControlServer.SPI.Communication;
+using DuetAPI.Machine;
+using DuetControlServer.Files;
+using DuetControlServer.SPI.Communication.Shared;
 using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
@@ -9,6 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Code = DuetControlServer.Commands.Code;
 
 namespace DuetControlServer.SPI
 {
@@ -34,14 +36,31 @@ namespace DuetControlServer.SPI
         public ChannelInformation(CodeChannel channel)
         {
             Channel = channel;
-
             _logger = NLog.LogManager.GetLogger(channel.ToString());
+
+            Model.Provider.Get.Inputs[Channel].PropertyChanged += (sender, e) =>
+            {
+                if (e.PropertyName.Equals(nameof(InputChannel.State)) &&
+                    (InputChannelState)sender.GetType().GetProperty(e.PropertyName).GetValue(sender) != InputChannelState.AwaitingAcknowledgement)
+                {
+                    using (_lock.Lock())
+                    {
+                        // Make sure the G-code flow is resumed even if the message box is closed from RRF
+                        MessageAcknowledged();
+                    }
+                }
+            };
         }
 
         /// <summary>
         /// Indicates if this channel is blocked until the next full transfer
         /// </summary>
         public bool IsBlocked { get; set; }
+
+        /// <summary>
+        /// Indicates if this channel is blocked because it is waiting for a confirmation
+        /// </summary>
+        public bool WaitingForAcknowledgement { get; private set; }
 
         /// <summary>
         /// Prioritised codes that override every other code
@@ -168,6 +187,75 @@ namespace DuetControlServer.SPI
         }
 
         /// <summary>
+        /// Process another code
+        /// </summary>
+        /// <param name="code">Code to process</param>
+        public Task<CodeResult> ProcessCode(Code code)
+        {
+            QueuedCode item = null;
+            if (code.Flags.HasFlag(CodeFlags.IsPrioritized))
+            {
+                // This code is supposed to override every other queued code
+                item = new QueuedCode(code);
+                PriorityCodes.Enqueue(item);
+            }
+            else if (code.IsInsertedFromMacro)
+            {
+                // This code is supposed to be executed before the next macro code
+                item = new QueuedCode(code);
+                InsertMacroCode(item);
+            }
+            else if (code.Flags.HasFlag(CodeFlags.IsFromMacro))
+            {
+                // Regular macro codes are already enqueued at the time this is called
+                bool firstMacro = true;
+                foreach (MacroFile macroFile in NestedMacros)
+                {
+                    foreach (QueuedCode queuedCode in macroFile.PendingCodes)
+                    {
+                        if (queuedCode.Code == code)
+                        {
+                            item = queuedCode;
+                            break;
+                        }
+                    }
+
+                    if (item != null)
+                    {
+                        if (!firstMacro)
+                        {
+                            _logger.Warn("Code {0} was internally processed but another macro is still pending", code);
+                        }
+                        break;
+                    }
+                    firstMacro = false;
+                }
+
+                // Users may want to enqueue custom codes as well when dealing with macro files
+                if (item == null)
+                {
+                    if (NestedMacros.TryPeek(out MacroFile macroFile))
+                    {
+                        item = new QueuedCode(code);
+                        macroFile.PendingCodes.Enqueue(item);
+                    }
+                    else
+                    {
+                        throw new ArgumentException("No macro file being executed");
+                    }
+                }
+            }
+            else
+            {
+                // Enqueue this code for regular execution
+                item = new QueuedCode(code);
+                PendingCodes.Enqueue(item);
+            }
+            item.IsReadyToSend = true;
+            return item.Task;
+        }
+
+        /// <summary>
         /// Process pending requests on this channel
         /// </summary>
         /// <returns>If anything more can be done on this channel</returns>
@@ -210,10 +298,10 @@ namespace DuetControlServer.SPI
             }
 
             // 4. Macros
-            if (NestedMacros.TryPeek(out MacroFile macroFile))
+            if (!WaitingForAcknowledgement && NestedMacros.TryPeek(out MacroFile macroFile))
             {
                 // Fill up the macro code buffer
-                Commands.Code code = null;
+                Code code = null;
                 if (macroFile.PendingCodes.Count < Settings.BufferedMacroCodes)
                 {
                     try
@@ -226,41 +314,10 @@ namespace DuetControlServer.SPI
                     }
                 }
 
+                // Start the next code in the background. An interceptor may also generate extra codes
                 if (code != null)
                 {
-                    // Start the next code in the background. An interceptor may also generate extra codes
-                    queuedCode = new QueuedCode(code);
-                    macroFile.PendingCodes.Enqueue(queuedCode);
-                    _ = code.Execute().ContinueWith(async task =>
-                    {
-                        try
-                        {
-                            CodeResult result = await task;
-                            if (!queuedCode.IsReadyToSend)
-                            {
-                                // Macro codes need special treatment because they may complete before they are actually
-                                // sent to RepRapFirmware. Remove them from the NestedMacroCodes again in this case
-                                queuedCode.HandleReply(result);
-                            }
-
-                            if (macroFile.StartCode == null)
-                            {
-                                await Utility.Logger.LogOutput(result);
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            // Something has gone wrong and the SPI connector has invalidated everything - don't deal with this (yet?)
-                        }
-                        catch (Exception e)
-                        {
-                            if (e is AggregateException ae)
-                            {
-                                e = ae.InnerException;
-                            }
-                            await Utility.Logger.LogOutput(MessageType.Error, $"Failed to execute {code.ToShortString()}: [{e.GetType().Name}] {e.Message}");
-                        }
-                    });
+                    DoMacroCode(code, macroFile);
                     return true;
                 }
 
@@ -314,8 +371,8 @@ namespace DuetControlServer.SPI
                 return false;
             }
 
-            // 5. Regular codes
-            if (PendingCodes.TryPeek(out queuedCode))
+            // 5. Pending codes
+            if ((!WaitingForAcknowledgement || Channel != CodeChannel.File) && PendingCodes.TryPeek(out queuedCode))
             {
                 if (BufferCode(queuedCode))
                 {
@@ -337,6 +394,127 @@ namespace DuetControlServer.SPI
         }
 
         /// <summary>
+        /// Perform a code in the background
+        /// </summary>
+        /// <param name="code">Code to execute</param>
+        /// <param name="macroFile">Macro file that started this code</param>
+        private void DoMacroCode(Code code, MacroFile macroFile)
+        {
+            QueuedCode queuedCode = new QueuedCode(code);
+            macroFile.PendingCodes.Enqueue(queuedCode);
+
+            _ = code.Execute().ContinueWith(async task =>
+            {
+                try
+                {
+                    CodeResult result = await task;
+                    if (!queuedCode.IsReadyToSend)
+                    {
+                        // Macro codes need special treatment because they are not processed in the main SPI interface
+                        queuedCode.HandleReply(result);
+                    }
+
+                    if (macroFile.StartCode == null)
+                    {
+                        await Utility.Logger.LogOutput(result);
+                    }
+                    else
+                    {
+                        macroFile.StartCode.HandleReply(result);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    if (!queuedCode.IsReadyToSend)
+                    {
+                        // Code has been cancelled. Don't log this
+                        queuedCode.SetCancelled();
+                    }
+                }
+                catch (AggregateException ae)
+                {
+                    await Utility.Logger.LogOutput(MessageType.Error, $"Failed to execute {code.ToShortString()}: [{ae.InnerException.GetType().Name}] {ae.InnerException.Message}");
+                    macroFile.Abort();
+                    if (!queuedCode.IsReadyToSend)
+                    {
+                        queuedCode.SetException(ae.InnerException);
+                    }
+                }
+                catch (Exception e)
+                {
+                    await Utility.Logger.LogOutput(MessageType.Error, $"Failed to execute {code.ToShortString()}: [{e.GetType().Name}] {e.Message}");
+                    macroFile.Abort();
+                    if (!queuedCode.IsReadyToSend)
+                    {
+                        queuedCode.SetException(e);
+                    }
+                }
+            }, TaskContinuationOptions.RunContinuationsAsynchronously);
+        }
+
+        /// <summary>
+        /// Perform a regular code that was requested from the firmware
+        /// </summary>
+        /// <param name="code">Code to perform</param>
+        public void DoFirmwareCode(string code)
+        {
+            try
+            {
+                _logger.Info("Running code from firmware '{0}' on channel {1}", code, Channel);
+                Code codeObj = new Code(code) { Channel = Channel, Flags = CodeFlags.IsFromFirmware };
+                _ = codeObj.Execute().ContinueWith(async task =>
+                {
+                    try
+                    {
+                        CodeResult result = await task;
+                        foreach (Message message in result)
+                        {
+                            // Check what kind of message this is
+                            MessageTypeFlags flags = (MessageTypeFlags)(1 << (int)Channel);
+                            if (message.Type != MessageType.Success)
+                            {
+                                flags |= (message.Type == MessageType.Error) ? MessageTypeFlags.ErrorMessageFlag : MessageTypeFlags.WarningMessageFlag;
+                            }
+
+                            // Split the message into multiple chunks so RRF can output it
+                            Memory<byte> encodedMessage = Encoding.UTF8.GetBytes(result.ToString());
+                            for (int i = 0; i < encodedMessage.Length; i += Communication.Consts.MaxMessageLength)
+                            {
+                                if (i + Communication.Consts.MaxMessageLength >= encodedMessage.Length)
+                                {
+                                    Memory<byte> partialMessage = encodedMessage.Slice(i);
+                                    Interface.SendMessage(flags, Encoding.UTF8.GetString(partialMessage.ToArray()));
+                                }
+                                else
+                                {
+                                    Memory<byte> partialMessage = encodedMessage.Slice(i, Math.Min(encodedMessage.Length - i, Communication.Consts.MaxMessageLength));
+                                    Interface.SendMessage(flags | MessageTypeFlags.PushFlag, Encoding.UTF8.GetString(partialMessage.ToArray()));
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Code has been cancelled. Don't log this
+                    }
+                    catch (AggregateException ae)
+                    {
+                        await Utility.Logger.LogOutput(MessageType.Error, $"Failed to execute {code} from firmware: [{ae.InnerException.GetType().Name}] {ae.InnerException.Message}");
+                    }
+                    catch (Exception e)
+                    {
+                        await Utility.Logger.LogOutput(MessageType.Error, $"Failed to execute {code} from firmware: [{e.GetType().Name}] {e.Message}");
+                    }
+                }, TaskContinuationOptions.RunContinuationsAsynchronously);
+            }
+            catch (CodeParserException cpe)
+            {
+                MessageTypeFlags flags = (MessageTypeFlags)(1 << (int)Channel) | MessageTypeFlags.ErrorMessageFlag;
+                Interface.SendMessage(flags, "Failed to parse firmware code: " + cpe.Message);
+            }
+        }
+
+        /// <summary>
         /// Store an enqueued code for transmission to RepRapFirmware
         /// </summary>
         /// <param name="queuedCode">Code to transfer</param>
@@ -345,7 +523,7 @@ namespace DuetControlServer.SPI
         {
             try
             {
-                if (Interface.BufferCode(queuedCode, out int codeLength))
+                if (Interface.SendCode(queuedCode, out int codeLength))
                 {
                     BytesBuffered += codeLength;
                     BufferedCodes.Add(queuedCode);
@@ -375,6 +553,7 @@ namespace DuetControlServer.SPI
         /// <returns>Whether the reply could be processed</returns>
         public bool HandleReply(MessageTypeFlags flags, string reply)
         {
+            // Deal with log messages
             if (flags.HasFlag(MessageTypeFlags.LogMessage))
             {
                 _partialLogMessage += reply;
@@ -391,44 +570,41 @@ namespace DuetControlServer.SPI
                 }
             }
 
+            // Deal with replies following an attempt to open an invalid file
             if (SystemMacroHadError)
             {
                 SystemMacroHadError = false;
                 return true;
             }
 
-            if (NestedMacros.TryPeek(out MacroFile macroFile))
+            // Deal with macro files being finished
+            if (!WaitingForAcknowledgement && NestedMacros.TryPeek(out MacroFile macroFile) &&
+                ((macroFile.StartCode != null && !macroFile.StartCode.DoingNestedMacro) ||
+                 (macroFile.StartCode == null && SystemMacroHasFinished)))
             {
-                if ((macroFile.StartCode != null && !macroFile.StartCode.DoingNestedMacro) || (macroFile.StartCode == null && SystemMacroHasFinished))
-                {
-                    if (macroFile.StartCode != null)
-                    {
-                        macroFile.StartCode.HandleReply(flags, reply);
-                        if (macroFile.IsFinished)
-                        {
-                            NestedMacros.Pop().Dispose();
-                            _logger.Info("Finished macro file {0}", Path.GetFileName(macroFile.FileName));
-                            if (macroFile.StartCode != null)
-                            {
-                                _logger.Debug("==> Starting code: {0}", macroFile.StartCode);
-                            }
-                        }
-                    }
-                    else if (!flags.HasFlag(MessageTypeFlags.PushFlag))
-                    {
-                        NestedMacros.Pop().Dispose();
-                        SystemMacroHasFinished = false;
-                        _logger.Info("Finished system macro file {0}", Path.GetFileName(macroFile.FileName));
-                    }
-                    return true;
-                }
-
                 if (macroFile.StartCode != null)
                 {
                     macroFile.StartCode.HandleReply(flags, reply);
+                    if (macroFile.IsFinished)
+                    {
+                        NestedMacros.Pop().Dispose();
+                        _logger.Info("Finished macro file {0}", Path.GetFileName(macroFile.FileName));
+                        if (macroFile.StartCode != null)
+                        {
+                            _logger.Debug("==> Starting code: {0}", macroFile.StartCode);
+                        }
+                    }
                 }
+                else if (!flags.HasFlag(MessageTypeFlags.PushFlag))
+                {
+                    NestedMacros.Pop().Dispose();
+                    SystemMacroHasFinished = false;
+                    _logger.Info("Finished system macro file {0}", Path.GetFileName(macroFile.FileName));
+                }
+                return true;
             }
 
+            // Deal with other codes
             if (BufferedCodes.Count > 0)
             {
                 BufferedCodes[0].HandleReply(flags, reply);
@@ -440,12 +616,36 @@ namespace DuetControlServer.SPI
                 return true;
             }
 
-            // Replies from the code queue or a final empty response from the file are expected
-            if (Channel != CodeChannel.CodeQueue && Channel != CodeChannel.File)
+            // Unless this message comes from the file or code queue it is out-of-order...
+            if (Channel != CodeChannel.File && Channel != CodeChannel.Queue && !string.IsNullOrEmpty(reply))
             {
                 _logger.Warn("Out-of-order reply: '{0}'", reply);
             }
             return false;
+        }
+
+        /// <summary>
+        /// Wait for a message to be acknowledged
+        /// </summary>
+        public void WaitForAcknowledgement()
+        {
+            if (!WaitingForAcknowledgement)
+            {
+                SuspendBuffer();
+                WaitingForAcknowledgement = true;
+            }
+        }
+
+        /// <summary>
+        /// Called when a message has been acknowledged
+        /// </summary>
+        public void MessageAcknowledged()
+        {
+            if (WaitingForAcknowledgement)
+            {
+                WaitingForAcknowledgement = false;
+                _resumingBuffer = true;
+            }
         }
 
         /// <summary>
@@ -789,8 +989,9 @@ namespace DuetControlServer.SPI
         {
             bool resourceInvalidated = false;
 
-            Commands.Code.CancelPending(Channel);
+            Code.CancelPending(Channel);
 
+            WaitingForAcknowledgement = false;
             while (SuspendedCodes.TryPop(out Queue<QueuedCode> suspendedCodes))
             {
                 while (suspendedCodes.TryDequeue(out QueuedCode queuedCode))

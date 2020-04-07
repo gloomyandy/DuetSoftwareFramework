@@ -1,5 +1,5 @@
 ﻿using DuetAPI.Commands;
-using DuetControlServer.FileExecution;
+using DuetControlServer.Files;
 using NUnit.Framework;
 using System.IO;
 
@@ -11,7 +11,7 @@ namespace UnitTests.File
         [Test]
         public void TestPosition()
         {
-            string filePath = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "File/GCodes/Cura.gcode");
+            string filePath = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "../../../File/GCodes/Cura.gcode");
             BaseFile file = new BaseFile(filePath, DuetAPI.CodeChannel.File);
             Code code;
 

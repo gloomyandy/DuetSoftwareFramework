@@ -83,11 +83,6 @@ namespace DuetControlServer
         public static int HostUpdateInterval { get; set; } = 4000;
 
         /// <summary>
-        /// How frequently the config response is polled (in ms; temporary; will be removed once the new object model has been finished)
-        /// </summary>
-        public static int ConfigUpdateInterval { get; set; } = 5000;
-
-        /// <summary>
         /// Maximum time to keep messages in the object model unless client(s) pick them up (in s).
         /// Note that messages are only cleared when the host update task runs.
         /// </summary>
@@ -99,9 +94,9 @@ namespace DuetControlServer
         public static string SpiDevice { get; set; } = "/dev/spidev0.0";
 
         /// <summary>
-        /// Frequency to use for SPI transfers
+        /// Frequency to use for SPI transfers (in Hz)
         /// </summary>
-        public static int SpiFrequency { get; set; } = 2_000_000;
+        public static int SpiFrequency { get; set; } = 8_000_000;
 
         /// <summary>
         /// Maximum allowed delay between data exchanges during a full transfer (in ms)
@@ -117,6 +112,11 @@ namespace DuetControlServer
         /// Time to wait after every full transfer (in ms)
         /// </summary>
         public static int SpiPollDelay { get; set; } = 25;
+
+        /// <summary>
+        /// Time to wait after every full transfer when simulating a file (in ms)
+        /// </summary>
+        public static int SpiPollDelaySimulating { get; set; } = 5;
 
         /// <summary>
         /// Path to the GPIO chip device node
@@ -139,15 +139,14 @@ namespace DuetControlServer
         public static int BufferedMacroCodes { get; set; } = 16;
 
         /// <summary>
-        /// Maximum space of buffered codes per channel (in bytes). Must be greater than <see cref="SPI.Communication.Consts.MaxCodeBufferSize"/>
+        /// Maximum space of buffered codes per channel (in bytes)
         /// </summary>
         public static int MaxBufferSpacePerChannel { get; set; } = 1536;
 
         /// <summary>
-        /// Interval of regular status updates (in ms)
+        /// Interval of object model updates (in ms)
         /// </summary>
-        /// <remarks>This is preliminary and will be removed from future versions</remarks>
-        public static double ModelUpdateInterval { get; set; } = 125.0;
+        public static int ModelUpdateInterval { get; set; } = 250;
 
         /// <summary>
         /// Maximum lock time of the object model. If this time is exceeded, a deadlock is reported and the application is terminated.
@@ -180,7 +179,7 @@ namespace DuetControlServer
         /// </summary>
         public static List<Regex> LayerHeightFilters { get; set; } = new List<Regex>
         {
-            new Regex(@"layer_height\D+(?<mm>(\d+\.?\d*))", RegexFlags),                // Slic3r
+            new Regex(@"\slayer_height\D+(?<mm>(\d+\.?\d*))", RegexFlags),              // Slic3r / Prusa Slicer
             new Regex(@"Layer height\D+(?<mm>(\d+\.?\d*))", RegexFlags),                // Cura
             new Regex(@"layerHeight\D+(?<mm>(\d+\.?\d*))", RegexFlags),                 // Simplify3D
             new Regex(@"layer_thickness_mm\D+(?<mm>(\d+\.?\d*))", RegexFlags),          // KISSlicer and Canvas
@@ -194,8 +193,9 @@ namespace DuetControlServer
         {
             new Regex(@"filament used\D+(((?<mm>\d+\.?\d*)mm)(\D+)?)+", RegexFlags),        // Slic3r (mm)
             new Regex(@"filament used\D+(((?<m>\d+\.?\d*)m([^m]|$))(\D+)?)+", RegexFlags),  // Cura (m)
-            new Regex(@"material\#\d+\D+(?<mm>\d+\.?\d*)", RegexFlags),                     // IdeaMaker (mm)
             new Regex(@"filament length\D+(((?<mm>\d+\.?\d*)\s*mm)(\D+)?)+", RegexFlags),   // Simplify3D (mm)
+            new Regex(@"filament used \[mm\]\D+(?<mm>\d+\.?\d*)", RegexFlags),              // Prusa Slicer (mm)
+            new Regex(@"material\#\d+\D+(?<mm>\d+\.?\d*)", RegexFlags),                     // IdeaMaker (mm)
             new Regex(@"Filament used per extruder:\r\n;\s*(?<name>.+)\s+=\s*(?<mm>[0-9.]+)", RegexFlags)   // Canvas
         };
 
@@ -267,11 +267,6 @@ namespace DuetControlServer
             {
                 LoadFromFile(ConfigFilename);
                 ParseParameters(args);
-
-                if (MaxBufferSpacePerChannel < SPI.Communication.Consts.MaxCodeBufferSize)
-                {
-                    throw new ArgumentException($"{nameof(MaxBufferSpacePerChannel)} is too low");
-                }
             }
             else
             {
