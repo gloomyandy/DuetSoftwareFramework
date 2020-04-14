@@ -1,5 +1,7 @@
 ﻿using DuetAPI.Machine;
+using DuetControlServer.FileExecution;
 using DuetControlServer.Files;
+using DuetControlServer.Model;
 using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
@@ -23,6 +25,11 @@ namespace DuetControlServer.Utility
         /// First line identifying the filament file
         /// </summary>
         private const string FilamentsCsvHeader = "RepRapFirmware filament assignment file v1";
+
+        /// <summary>
+        /// Logger instance
+        /// </summary>
+        private static readonly NLog.Logger _logger = NLog.LogManager.GetCurrentClassLogger();
 
         /// <summary>
         /// Lock for this class
@@ -63,7 +70,7 @@ namespace DuetControlServer.Utility
                 }
             }
 
-            Model.Provider.Get.Move.Extruders.CollectionChanged += Extruders_CollectionChanged;
+            Provider.Get.Move.Extruders.CollectionChanged += Extruders_CollectionChanged;
         }
 
         /// <summary>
@@ -81,6 +88,7 @@ namespace DuetControlServer.Utility
                     {
                         if (extruderObject is Extruder extruder)
                         {
+                            // Extruder removed
                             extruder.PropertyChanged -= ExtruderPropertyChanged;
                         }
                     }
@@ -92,11 +100,12 @@ namespace DuetControlServer.Utility
                     {
                         if (extruderObject is Extruder extruder)
                         {
-                            int extruderDrive = Model.Provider.Get.Move.Extruders.IndexOf(extruder);
-                            if (_filamentMapping.TryGetValue(extruderDrive, out string filamentName) && extruder.Filament != filamentName)
+                            int extruderIndex = Provider.Get.Move.Extruders.IndexOf(extruder);
+                            if (_filamentMapping.TryGetValue(extruderIndex, out string filament) && extruder.Filament != filament)
                             {
-                                // Tell RepRapFirmware about the loaded filament
-                                SPI.Interface.AssignFilament(extruderDrive, filamentName);
+                                // Extruder added. Tell RepRapFirmware about the loaded filament
+                                _logger.Debug("Assigning filament {0} to extruder drive {1}", filament, extruderIndex);
+                                SPI.Interface.AssignFilament(extruderIndex, filament);
                             }
                             extruder.PropertyChanged += ExtruderPropertyChanged;
                         }
@@ -117,11 +126,22 @@ namespace DuetControlServer.Utility
                 Extruder extruder = (Extruder)sender;
                 using (_lock.Lock())
                 {
-                    int extruderIndex = Model.Provider.Get.Move.Extruders.IndexOf(extruder);
+                    int extruderIndex = Provider.Get.Move.Extruders.IndexOf(extruder);
                     if (!_filamentMapping.TryGetValue(extruderIndex, out string filament) || filament != extruder.Filament)
                     {
-                        _filamentMapping[extruderIndex] = extruder.Filament;
-                        SaveMapping();
+                        if (!string.IsNullOrEmpty(filament) && Macro.RunningConfig)
+                        {
+                            // Booting RRF, tell it about the loaded filament
+                            _logger.Debug("Assigning filament {0} to extruder drive {1}", filament, extruderIndex);
+                            SPI.Interface.AssignFilament(extruderIndex, filament);
+                        }
+                        else
+                        {
+                            // Filament changed
+                            _logger.Debug("Filament {0} has been assigned to extruder drive {1}", extruder.Filament, extruderIndex);
+                            _filamentMapping[extruderIndex] = extruder.Filament;
+                            SaveMapping();
+                        }
                     }
                 }
             }
@@ -132,7 +152,7 @@ namespace DuetControlServer.Utility
         /// </summary>
         private static async void SaveMapping()
         {
-            using (await _lock.LockAsync())
+            using (await _lock.LockAsync(Program.CancellationToken))
             {
                 string filename = await FilePath.ToPhysicalAsync(FilamentsCsvFile, FileDirectory.System);
                 using FileStream fs = new FileStream(filename, FileMode.Create, FileAccess.Write);

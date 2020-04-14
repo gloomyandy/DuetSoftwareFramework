@@ -2,6 +2,7 @@
 using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -118,8 +119,8 @@ namespace DuetControlServer.Model
                                 {
                                     Provider.Get.Boards.Add(new Board
                                     {
-                                        IapFileNameSBC = $"Duet3iap_spi.bin",
-                                        FirmwareFileName = "Duet3Firmware.bin"
+                                        IapFileNameSBC = $"Duet3_SDiap_MB6HC.bin",
+                                        FirmwareFileName = "Duet3Firmware_MB6HC.bin"
                                     });
                                 }
                                 _logger.Warn("Deprecated firmware detected, assuming legacy firmware files. You may have to use bossa to update it");
@@ -144,7 +145,7 @@ namespace DuetControlServer.Model
                                 bool objectModelSynchronized = true;
                                 foreach (JsonProperty seqProperty in result.GetProperty("seqs").EnumerateObject())
                                 {
-                                    if (seqProperty.Name != "reply")
+                                    if (seqProperty.Name != "reply" && (!Settings.UpdateOnly || seqProperty.Name == "boards"))
                                     {
                                         int newSeq = seqProperty.Value.GetInt32();
                                         if (!_lastSeqs.TryGetValue(seqProperty.Name, out int lastSeq) || lastSeq != newSeq)
@@ -156,6 +157,9 @@ namespace DuetControlServer.Model
                                         }
                                     }
                                 }
+
+                                // Update the layers
+                                UpdateLayers();
 
                                 if (objectModelSynchronized)
                                 {
@@ -203,23 +207,91 @@ namespace DuetControlServer.Model
         }
 
         /// <summary>
+        /// Update the layers
+        /// </summary>
+        private static void UpdateLayers()
+        {
+            if (Provider.Get.State.Status != MachineStatus.Processing && Provider.Get.State.Status != MachineStatus.Simulating)
+            {
+                // Don't do anything if no print is in progress
+                return;
+            }
+
+            // Check if the last layer is complete
+            if (Provider.Get.Job.Layer > Provider.Get.Job.Layers.Count + 1)
+            {
+                float[] extrRaw = (from extruder in Provider.Get.Move.Extruders
+                                   where extruder != null
+                                   select extruder.RawPosition).ToArray();
+                float fractionPrinted = (float)((double)Provider.Get.Job.FilePosition / Provider.Get.Job.File.Size);
+                float currentHeight = Provider.Get.Move.Axes.FirstOrDefault(axis => axis.Letter == 'Z').UserPosition ?? 0F;
+
+                float lastHeight = 0F, lastProgress = 0F;
+                int lastDuration = 0;
+                float[] lastFilamentUsage = new float[extrRaw.Length];
+                foreach (Layer l in Provider.Get.Job.Layers)
+                {
+                    lastHeight += l.Height;
+                    lastDuration += l.Duration;
+                    lastProgress += l.FractionPrinted;
+                    for (int i = 0; i < Math.Min(lastFilamentUsage.Length, l.Filament.Count); i++)
+                    {
+                        lastFilamentUsage[i] += l.Filament[i];
+                    }
+                }
+
+                float[] filamentUsage = new float[extrRaw.Length];
+                for (int i = 0; i < filamentUsage.Length; i++)
+                {
+                    filamentUsage[i] = extrRaw[i] - lastFilamentUsage[i];
+                }
+
+                int printDuration = Provider.Get.Job.Duration.Value - Provider.Get.Job.WarmUpDuration.Value;
+                Layer layer = new Layer
+                {
+                    Duration = printDuration - lastDuration,
+                    FractionPrinted = fractionPrinted - lastProgress,
+                    Height = (Provider.Get.Job.Layer > 2) ? currentHeight - lastHeight : Provider.Get.Job.File.FirstLayerHeight
+                };
+                foreach (float filamentItem in filamentUsage)
+                {
+                    layer.Filament.Add(filamentItem);
+                }
+
+                Provider.Get.Job.Layers.Add(layer);
+            }
+            else if (Provider.Get.Job.Layer < Provider.Get.Job.Layers.Count)
+            {
+                // Starting a new print job, clear the layers
+                Provider.Get.Job.Layers.Clear();
+            }
+        }
+
+        /// <summary>
         /// Called when the connection to the Duet has been lost
         /// </summary>
-        /// <param name="errorMessage">Message of the error that led to this event</param>
-        public static void ConnectionLost(string errorMessage)
+        /// <param name="errorMessage">Optional error that led to this event</param>
+        public static void ConnectionLost(string errorMessage = null)
         {
             using (Provider.AccessReadWrite())
             {
                 Provider.Get.Boards.Clear();
-                Provider.Get.State.Status = MachineStatus.Off;
+                if (Provider.Get.State.Status != MachineStatus.Halted && Provider.Get.State.Status != MachineStatus.Updating)
+                {
+                    Provider.Get.State.Status = MachineStatus.Off;
+                }
             }
 
             using (_lock.Lock())
             {
+                // Query the full object model when a connection can be established again
                 _lastSeqs.Clear();
             }
 
-            _ = Utility.Logger.LogOutput(MessageType.Warning, $"Lost connection to Duet ({errorMessage})");
+            if (!string.IsNullOrEmpty(errorMessage))
+            {
+                _ = Utility.Logger.LogOutput(MessageType.Warning, $"Lost connection to Duet ({errorMessage})");
+            }
         }
     }
 }

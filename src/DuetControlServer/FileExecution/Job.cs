@@ -35,13 +35,13 @@ namespace DuetControlServer.FileExecution
         /// Lock this class
         /// </summary>
         /// <returns>Disposable lock</returns>
-        public static IDisposable Lock() => _lock.Lock();
+        public static IDisposable Lock() => _lock.Lock(Program.CancellationToken);
 
         /// <summary>
         /// Lock this class asynchronously
         /// </summary>
         /// <returns>Disposable lock</returns>
-        public static AwaitableDisposable<IDisposable> LockAsync() => _lock.LockAsync();
+        public static AwaitableDisposable<IDisposable> LockAsync() => _lock.LockAsync(Program.CancellationToken);
 
         /// <summary>
         /// Condition to trigger when the print is supposed to resume
@@ -56,7 +56,7 @@ namespace DuetControlServer.FileExecution
         /// <summary>
         /// Job file being read from
         /// </summary>
-        private static BaseFile _file;
+        private static CodeFile _file;
 
         /// <summary>
         /// Indicates if a file has been selected for printing
@@ -120,7 +120,7 @@ namespace DuetControlServer.FileExecution
         {
             // Analyze and open the file
             ParsedFileInfo info = await InfoParser.Parse(fileName);
-            BaseFile file = new BaseFile(fileName, CodeChannel.File);
+            CodeFile file = new CodeFile(fileName, CodeChannel.File);
 
             // A file being printed may start another file print
             if (IsFileSelected)
@@ -297,10 +297,13 @@ namespace DuetControlServer.FileExecution
         /// <param name="pauseReason">Reason why the print has been paused</param>
         public static void Pause(long? filePosition, PrintPausedReason pauseReason)
         {
-            Code.CancelPending(CodeChannel.File);
-            IsPaused = true;
-            _pausePosition = filePosition;
-            _pauseReason = pauseReason;
+            if (IsFileSelected)
+            {
+                _file.CancelPendingCodes();
+                IsPaused = true;
+                _pausePosition = filePosition;
+                _pauseReason = pauseReason;
+            }
         }
 
         /// <summary>
@@ -320,7 +323,6 @@ namespace DuetControlServer.FileExecution
         /// </summary>
         public static void Cancel()
         {
-            Code.CancelPending(CodeChannel.File);
             _file?.Abort();
             Resume();
         }
@@ -342,7 +344,7 @@ namespace DuetControlServer.FileExecution
         /// <returns>Asynchronous task</returns>
         public static async Task Diagnostics(StringBuilder builder)
         {
-            using (await _lock.LockAsync())
+            using (await _lock.LockAsync(Program.CancellationToken))
             {
                 if (IsFileSelected)
                 {

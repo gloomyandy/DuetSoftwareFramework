@@ -7,6 +7,7 @@ using DuetAPI;
 using DuetAPI.Commands;
 using DuetAPI.Machine;
 using DuetAPI.Utility;
+using DuetControlServer.FileExecution;
 using DuetControlServer.Files;
 using DuetControlServer.SPI.Communication;
 using DuetControlServer.SPI.Communication.FirmwareRequests;
@@ -27,7 +28,7 @@ namespace DuetControlServer.SPI
         private static readonly NLog.Logger _logger = NLog.LogManager.GetCurrentClassLogger();
 
         // Information about the code channels
-        private static readonly ChannelStore _channels = new ChannelStore();
+        private static readonly Channel.Manager _channels = new Channel.Manager();
         private static int _bytesReserved = 0, _bufferSpace = 0;
 
         // Object model queries
@@ -53,7 +54,7 @@ namespace DuetControlServer.SPI
         private static readonly Queue<Tuple<int, string>> _extruderFilamentUpdates = new Queue<Tuple<int, string>>();
         private static readonly AsyncLock _printStopppedReasonLock = new AsyncLock();
         private static PrintStoppedReason? _printStoppedReason;
-        private static volatile bool _emergencyStopRequested, _resetRequested, _printStarted;
+        private static volatile bool _emergencyStopRequested, _resetRequested, _printStarted, _assignFilaments;
         private static readonly Queue<Tuple<MessageTypeFlags, string>> _messagesToSend = new Queue<Tuple<MessageTypeFlags, string>>();
 
         // Partial incoming message (if any)
@@ -74,13 +75,7 @@ namespace DuetControlServer.SPI
         /// <returns>Asynchronous task</returns>
         public static async Task Diagnostics(StringBuilder builder)
         {
-            foreach (ChannelInformation channel in _channels)
-            {
-                using (await channel.LockAsync())
-                {
-                    channel.Diagnostics(builder);
-                }
-            }
+            await _channels.Diagnostics(builder);
             builder.AppendLine($"Code buffer space: {_bufferSpace}");
         }
 
@@ -180,48 +175,7 @@ namespace DuetControlServer.SPI
         /// Get a channel that is currently idle in order to process a priority code
         /// </summary>
         /// <returns></returns>
-        public static async Task<CodeChannel> GetIdleChannel()
-        {
-            foreach (ChannelInformation channel in _channels)
-            {
-                using (await channel.LockAsync())
-                {
-                    if (channel.BufferedCodes.Count == 0)
-                    {
-                        return channel.Channel;
-                    }
-                }
-            }
-
-            _logger.Warn("Failed to find an idle channel, using fallback {0}", nameof(CodeChannel.Trigger));
-            return CodeChannel.Trigger;
-        }
-
-        /// <summary>
-        /// Checks if the given channel is waiting for acknowledgement
-        /// </summary>
-        /// <param name="channel">Channel to check</param>
-        /// <returns>Whether the channel is waiting for acknowledgement</returns>
-        public static bool IsWaitingForAcknowledgement(CodeChannel channel)
-        {
-            using (_channels[channel].Lock())
-            {
-                return _channels[channel].WaitingForAcknowledgement;
-            }
-        }
-
-        /// <summary>
-        /// Called when a message has been acknowledged
-        /// </summary>
-        /// <param name="channel">Code channel</param>
-        /// <returns>Asynchronous task</returns>
-        public static async Task MessageAcknowledged(CodeChannel channel)
-        {
-            using (await _channels[channel].LockAsync())
-            {
-                _channels[channel].MessageAcknowledged();
-            }
-        }
+        public static Task<CodeChannel> GetIdleChannel() => _channels.GetIdleChannel();
 
         /// <summary>
         /// Enqueue a G/M/T-code synchronously and obtain a task that completes when the code has finished
@@ -230,6 +184,13 @@ namespace DuetControlServer.SPI
         /// <returns>Asynchronous task</returns>
         public static Task<CodeResult> ProcessCode(Code code)
         {
+            if (code.Type == CodeType.MCode && code.MajorNumber == 703)
+            {
+                // It is safe to assume that the tools and extruders have been configured at this point.
+                // Assign the filaments next so that M703 works as intended
+                _assignFilaments = true;
+            }
+
             using (_channels[code.Channel].Lock())
             {
                 return _channels[code.Channel].ProcessCode(code);
@@ -243,42 +204,10 @@ namespace DuetControlServer.SPI
         /// <returns>Whether the codes have been flushed successfully</returns>
         public static Task<bool> Flush(CodeChannel channel)
         {
-            TaskCompletionSource<bool> tcs;
             using (_channels[channel].Lock())
             {
-                tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _channels[channel].PendingFlushRequests.Enqueue(tcs);
+                return _channels[channel].Flush();
             }
-            return tcs.Task;
-        }
-
-        /// <summary>
-        /// Wait for all pending (macro) codes to finish
-        /// </summary>
-        /// <param name="code">Code requesting the flush request</param>
-        /// <returns>Whether the codes have been flushed successfully</returns>
-        public static Task<bool> Flush(Code code)
-        {
-            code.WaitingForFlush = true;
-
-            TaskCompletionSource<bool> tcs;
-            using (_channels[code.Channel].Lock())
-            {
-                if (code.Flags.HasFlag(CodeFlags.IsFromMacro))
-                {
-                    if (_channels[code.Channel].NestedMacros.TryPeek(out MacroFile macroFile))
-                    {
-                        tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        macroFile.PendingFlushRequests.Enqueue(tcs);
-                        return tcs.Task;
-                    }
-                    return Task.FromResult(false);
-                }
-
-                tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _channels[code.Channel].PendingFlushRequests.Enqueue(tcs);
-            }
-            return tcs.Task;
         }
 
         /// <summary>
@@ -313,13 +242,14 @@ namespace DuetControlServer.SPI
         /// <returns>Asynchronous task</returns>
         public static async Task SetPrintStopped(PrintStoppedReason stopReason)
         {
-            using (await _printStopppedReasonLock.LockAsync())
+            using (await _printStopppedReasonLock.LockAsync(Program.CancellationToken))
             {
                 _printStoppedReason = stopReason;
             }
+
             using (await _channels[CodeChannel.File].LockAsync())
             {
-                _channels[CodeChannel.File].InvalidateBuffer(false);
+                _channels[CodeChannel.File].InvalidateRegular();
             }
         }
 
@@ -330,12 +260,10 @@ namespace DuetControlServer.SPI
         /// <returns>Whether the resource could be locked</returns>
         public static Task<bool> LockMovementAndWaitForStandstill(CodeChannel channel)
         {
-            QueuedLockRequest request = new QueuedLockRequest(true);
             using (_channels[channel].Lock())
             {
-                _channels[channel].PendingLockRequests.Enqueue(request);
+                return _channels[channel].LockMovementAndWaitForStandstill();
             }
-            return request.Task;
         }
 
         /// <summary>
@@ -345,12 +273,10 @@ namespace DuetControlServer.SPI
         /// <returns>Asynchronous task</returns>
         public static Task UnlockAll(CodeChannel channel)
         {
-            QueuedLockRequest request = new QueuedLockRequest(false);
             using (_channels[channel].Lock())
             {
-                _channels[channel].PendingLockRequests.Enqueue(request);
+                return _channels[channel].UnlockAll();
             }
-            return request.Task;
         }
 
         /// <summary>
@@ -363,7 +289,7 @@ namespace DuetControlServer.SPI
         public static async Task UpdateFirmware(Stream iapStream, Stream firmwareStream)
         {
             TaskCompletionSource<object> tcs;
-            using (await _firmwareUpdateLock.LockAsync())
+            using (await _firmwareUpdateLock.LockAsync(Program.CancellationToken))
             {
                 if (_firmwareUpdateRequest != null)
                 {
@@ -378,6 +304,10 @@ namespace DuetControlServer.SPI
             await tcs.Task;
         }
 
+        /// <summary>
+        /// Perform the firmware update internally
+        /// </summary>
+        /// <returns>Asynchronous task</returns>
         private static async Task PerformFirmwareUpdate()
         {
             using (await Model.Provider.AccessReadWriteAsync())
@@ -450,7 +380,7 @@ namespace DuetControlServer.SPI
                 else
                 {
                     // Wait for the IAP binary to restart the controller
-                    DataTransfer.WaitForIapReset();
+                    await DataTransfer.WaitForIapReset();
                     _logger.Info("Firmware update successful");
                 }
             }
@@ -535,7 +465,7 @@ namespace DuetControlServer.SPI
                 }
 
                 // Check if a firmware update is supposed to be performed
-                using (await _firmwareUpdateLock.LockAsync())
+                using (await _firmwareUpdateLock.LockAsync(Program.CancellationToken))
                 {
                     if (_iapStream != null && _firmwareStream != null)
                     {
@@ -590,7 +520,7 @@ namespace DuetControlServer.SPI
                 }
                 else
                 {
-                    using (await _printStopppedReasonLock.LockAsync())
+                    using (await _printStopppedReasonLock.LockAsync(Program.CancellationToken))
                     {
                         if (_printStoppedReason != null && DataTransfer.WritePrintStopped(_printStoppedReason.Value))
                         {
@@ -600,7 +530,7 @@ namespace DuetControlServer.SPI
                 }
 
                 // Deal with heightmap requests
-                using (await _heightmapLock.LockAsync())
+                using (await _heightmapLock.LockAsync(Program.CancellationToken))
                 {
                     // Check if the heightmap is supposed to be set
                     if (_setHeightmapRequest != null && DataTransfer.WriteHeightMap(_heightmapToSet))
@@ -640,31 +570,7 @@ namespace DuetControlServer.SPI
                 _bytesReserved = 0;
 
                 // Process pending codes, macro files and requests for resource locks/unlocks as well as flush requests
-                bool dataProcessed;
-                do
-                {
-                    dataProcessed = false;
-                    foreach (ChannelInformation channel in _channels)
-                    {
-                        using (await channel.LockAsync())
-                        {
-                            if (!channel.IsBlocked)
-                            {
-                                if (channel.ProcessRequests())
-                                {
-                                    // Something could be processed
-                                    dataProcessed = true;
-                                }
-                                else
-                                {
-                                    // Cannot do any more on this channel
-                                    channel.IsBlocked = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                while (dataProcessed);
+                await _channels.Run();
 
                 // Request object model updates
                 if (DateTime.Now - _lastQueryTime > TimeSpan.FromMilliseconds(Settings.ModelUpdateInterval))
@@ -730,14 +636,24 @@ namespace DuetControlServer.SPI
                     }
                 }
 
-                // Update filament assignment per extruder drive
-                lock (_extruderFilamentUpdates)
+                // Update filament assignment per extruder drive. This must happen when config.g has finished or M701 is requested
+                if (!Macro.RunningConfig || _assignFilaments)
                 {
-                    if (_extruderFilamentUpdates.TryPeek(out Tuple<int, string> filamentMapping) &&
-                        DataTransfer.WriteAssignFilament(filamentMapping.Item1, filamentMapping.Item2))
+                    lock (_extruderFilamentUpdates)
                     {
-                        _extruderFilamentUpdates.Dequeue();
+                        while (_extruderFilamentUpdates.TryPeek(out Tuple<int, string> filamentMapping))
+                        {
+                            if (DataTransfer.WriteAssignFilament(filamentMapping.Item1, filamentMapping.Item2))
+                            {
+                                _extruderFilamentUpdates.Dequeue();
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
                     }
+                    _assignFilaments = false;
                 }
 
                 // Do another full SPI transfe
@@ -756,23 +672,17 @@ namespace DuetControlServer.SPI
         }
 
         /// <summary>
-        /// Send a queued code to the firmware
+        /// Send a pending code to the firmware
         /// </summary>
-        /// <param name="queuedCode">Code to send</param>
+        /// <param name="code">Code to send</param>
         /// <param name="codeLength">Length of the binary code in bytes</param>
-        /// <returns>Whether the code could be processed</returns>
-        /// <remarks>The corresponding Channel is locked when this is called</remarks>
-        public static bool SendCode(QueuedCode queuedCode, out int codeLength)
+        /// <returns>Whether the code could be sent</returns>
+        internal static bool SendCode(Code code, int codeLength)
         {
-            codeLength = Consts.BufferedCodeHeaderSize + DataTransfer.GetCodeSize(queuedCode.Code);
-            int bytesBuffered = _channels[queuedCode.Code.Channel].BytesBuffered;
-            if (_bufferSpace > codeLength &&
-                (bytesBuffered == 0 || bytesBuffered + codeLength <= Settings.MaxBufferSpacePerChannel) &&
-                DataTransfer.WriteCode(queuedCode.Code))
+            if (_bufferSpace > codeLength && DataTransfer.WriteCode(code))
             {
                 _bytesReserved += codeLength;
                 _bufferSpace -= codeLength;
-                queuedCode.BinarySize = codeLength;
                 return true;
             }
             return false;
@@ -836,6 +746,7 @@ namespace DuetControlServer.SPI
         /// <returns>Asynchronous task</returns>
         private static void HandleObjectModel()
         {
+            _logger.Trace("Received object model");
             if (DataTransfer.ProtocolVersion == 1)
             {
                 DataTransfer.ReadLegacyConfigResponse(out ReadOnlySpan<byte> json);
@@ -859,12 +770,35 @@ namespace DuetControlServer.SPI
         }
 
         /// <summary>
+        /// Buffer for truncated log messages
+        /// </summary>
+        private static string _partialLogMessage;
+
+        /// <summary>
         /// Process an incoming message
         /// </summary>
         /// <returns>Asynchronous task</returns>
         private static async Task HandleMessage()
         {
             DataTransfer.ReadMessage(out MessageTypeFlags flags, out string reply);
+            _logger.Trace("Received message [{0}] {1}", flags, reply);
+
+            // Deal with log messages
+            if (flags.HasFlag(MessageTypeFlags.LogMessage))
+            {
+                _partialLogMessage += reply;
+                if (!flags.HasFlag(MessageTypeFlags.PushFlag))
+                {
+                    if (!string.IsNullOrWhiteSpace(_partialLogMessage))
+                    {
+                        MessageType type = flags.HasFlag(MessageTypeFlags.ErrorMessageFlag) ? MessageType.Error
+                                            : flags.HasFlag(MessageTypeFlags.WarningMessageFlag) ? MessageType.Warning
+                                                : MessageType.Success;
+                        await Utility.Logger.Log(type, _partialLogMessage);
+                    }
+                    _partialLogMessage = null;
+                }
+            }
 
             // Deal with generic replies
             if ((flags & MessageTypeFlags.GenericMessage) == MessageTypeFlags.GenericMessage ||
@@ -874,22 +808,11 @@ namespace DuetControlServer.SPI
                 return;
             }
 
-            // Check if this is a targeted message. If yes, send it to the corresponding code being executed
+            // Check if this is a code reply
             bool replyHandled = false;
             if (!replyHandled && flags.HasFlag(MessageTypeFlags.BinaryCodeReplyFlag))
             {
-                foreach (ChannelInformation channel in _channels)
-                {
-                    MessageTypeFlags channelFlag = (MessageTypeFlags)(1 << (int)channel.Channel);
-                    if (flags.HasFlag(channelFlag))
-                    {
-                        using (await channel.LockAsync())
-                        {
-                            replyHandled = channel.HandleReply(flags, reply);
-                        }
-                        break;
-                    }
-                }
+                replyHandled = await _channels.HandleReply(flags, reply);
             }
 
             if (!replyHandled)
@@ -928,9 +851,11 @@ namespace DuetControlServer.SPI
         private static async Task HandleMacroRequest()
         {
             DataTransfer.ReadMacroRequest(out CodeChannel channel, out bool reportMissing, out bool fromCode, out string filename);
+            _logger.Trace("Received macro request for file {0} on channel {1}", filename, channel);
+
             using (await _channels[channel].LockAsync())
             {
-                await _channels[channel].HandleMacroRequest(filename, reportMissing, fromCode);
+                await _channels[channel].DoMacroFile(filename, reportMissing, fromCode);
             }
         }
 
@@ -943,24 +868,9 @@ namespace DuetControlServer.SPI
             DataTransfer.ReadAbortFile(out CodeChannel channel, out bool abortAll);
             _logger.Info("Received file abort request on channel {0} for {1}", channel, abortAll ? "all files" : "the last file");
 
-            if (abortAll && channel == CodeChannel.File)
+            using (await _channels[channel].LockAsync())
             {
-                using (await FileExecution.Job.LockAsync())
-                {
-                    FileExecution.Job.Abort();
-                }
-            }
-
-            _channels[channel].InvalidateBuffer(!abortAll);
-            while (_channels[channel].NestedMacros.TryPop(out MacroFile macroFile))
-            {
-                macroFile.StartCode?.HandleReply(new CodeResult());
-                macroFile.Abort();
-                macroFile.Dispose();
-                if (!abortAll)
-                {
-                    break;
-                }
+                _channels[channel].AbortFile(abortAll);
             }
         }
 
@@ -971,14 +881,7 @@ namespace DuetControlServer.SPI
         private static async Task HandlePrintPaused()
         {
             DataTransfer.ReadPrintPaused(out uint filePosition, out PrintPausedReason pauseReason);
-
-            // Pause the print
-            using (await FileExecution.Job.LockAsync())
-            {
-                // Do NOT supply a file position if this is a pause request initiated from G-code because that would lead to an endless loop
-                bool filePositionValid = filePosition != Consts.NoFilePosition && pauseReason != PrintPausedReason.GCode && pauseReason != PrintPausedReason.FilamentChange;
-                FileExecution.Job.Pause(filePositionValid ? (long?)filePosition : null, pauseReason);
-            }
+            _logger.Trace("Received print pause notification for file position {0}, reason {1}", filePosition, pauseReason);
 
             // Update the object model
             using (await Model.Provider.AccessReadWriteAsync())
@@ -986,14 +889,18 @@ namespace DuetControlServer.SPI
                 Model.Provider.Get.State.Status = MachineStatus.Paused;
             }
 
+            // Pause the print
+            using (await FileExecution.Job.LockAsync())
+            {
+                // Do NOT supply a file position if this is a pause request initiated from G-code because that would lead to an endless loop
+                bool filePositionValid = (filePosition != Consts.NoFilePosition) && (pauseReason != PrintPausedReason.GCode) && (pauseReason != PrintPausedReason.FilamentChange);
+                FileExecution.Job.Pause(filePositionValid ? (long?)filePosition : null, pauseReason);
+            }
+
             // Resolve pending and buffered codes on the file channel
             using (await _channels[CodeChannel.File].LockAsync())
             {
-                while (_channels[CodeChannel.File].PendingCodes.TryDequeue(out QueuedCode code))
-                {
-                    code.SetCancelled();
-                }
-                _channels[CodeChannel.File].InvalidateBuffer(false);
+                _channels[CodeChannel.File].InvalidateRegular();
             }
         }
 
@@ -1004,7 +911,9 @@ namespace DuetControlServer.SPI
         private static async Task HandleHeightMap()
         {
             DataTransfer.ReadHeightMap(out Heightmap map);
-            using (await _heightmapLock.LockAsync())
+            _logger.Trace("Received heightmap");
+
+            using (await _heightmapLock.LockAsync(Program.CancellationToken))
             {
                 _getHeightmapRequest?.SetResult(map);
                 _getHeightmapRequest = null;
@@ -1018,13 +927,11 @@ namespace DuetControlServer.SPI
         private static async Task HandleResourceLocked()
         {
             DataTransfer.ReadCodeChannel(out CodeChannel channel);
+            _logger.Trace("Received resource locked notification for channel {0}", channel);
 
             using (await _channels[channel].LockAsync())
             {
-                if (_channels[channel].PendingLockRequests.TryDequeue(out QueuedLockRequest item))
-                {
-                    item.Resolve(true);
-                }
+                _channels[channel].ResourceLocked();
             }
         }
 
@@ -1062,6 +969,7 @@ namespace DuetControlServer.SPI
         private static void HandleEvaluationResult()
         {
             DataTransfer.ReadEvaluationResult(out string expression, out object result);
+            _logger.Trace("Received evaluation result for expression {0} = {1}", expression, result);
 
             lock (_evaluateExpressionRequests)
             {
@@ -1090,6 +998,7 @@ namespace DuetControlServer.SPI
         private static async Task HandleDoCode()
         {
             DataTransfer.ReadDoCode(out CodeChannel channel, out string code);
+            _logger.Trace("Received firmware code request on channel {0} => {1}", channel, code);
 
             using (await _channels[channel].LockAsync())
             {
@@ -1100,6 +1009,7 @@ namespace DuetControlServer.SPI
         private static async Task HandleWaitForAcknowledgement()
         {
             DataTransfer.ReadCodeChannel(out CodeChannel channel);
+            _logger.Trace("Received wait for message acknowledgement on channel {0}", channel);
 
             using (await _channels[channel].LockAsync())
             {
@@ -1123,7 +1033,7 @@ namespace DuetControlServer.SPI
             }
 
             // Resolve pending macros, unbuffered (system) codes and flush requests
-            foreach (ChannelInformation channel in _channels)
+            foreach (Channel.Processor channel in _channels)
             {
                 using (await channel.LockAsync())
                 {
@@ -1149,7 +1059,7 @@ namespace DuetControlServer.SPI
             }
 
             // Resolve pending heightmap requests
-            using (await _heightmapLock.LockAsync())
+            using (await _heightmapLock.LockAsync(Program.CancellationToken))
             {
                 if (_getHeightmapRequest != null)
                 {
@@ -1170,6 +1080,12 @@ namespace DuetControlServer.SPI
             lock (_messagesToSend)
             {
                 _messagesToSend.Clear();
+            }
+
+            // Clear filament assign requests
+            lock (_extruderFilamentUpdates)
+            {
+                while (_extruderFilamentUpdates.TryDequeue(out _)) { }
             }
 
             // Keep this event in the log...

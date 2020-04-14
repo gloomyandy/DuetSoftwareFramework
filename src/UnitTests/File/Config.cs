@@ -13,7 +13,7 @@ namespace UnitTests.File
         public void ProcessConfig()
         {
             string filePath = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "../../../File/GCodes/config.g");
-            MacroFile macro = new MacroFile(filePath, DuetAPI.CodeChannel.Trigger, null);
+            CodeFile macro = new CodeFile(filePath, DuetAPI.CodeChannel.Trigger);
 
             do
             {

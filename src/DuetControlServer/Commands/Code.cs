@@ -51,14 +51,9 @@ namespace DuetControlServer.Commands
             InsertedFromMacro = 3,
 
             /// <summary>
-            /// Code being executed while an acknowledgemenet is awaited
-            /// </summary>
-            BlockingRegular = 4,
-
-            /// <summary>
             /// Code with <see cref="CodeFlags.IsPrioritized"/> set
             /// </summary>
-            Prioritized = 5
+            Prioritized = 4
         }
 
         /// <summary>
@@ -112,7 +107,7 @@ namespace DuetControlServer.Commands
                 oldCTS.Dispose();
 
                 // Create a new one
-                _cancellationTokenSources[(int)channel] = new CancellationTokenSource();
+                _cancellationTokenSources[(int)channel] = CancellationTokenSource.CreateLinkedTokenSource(Program.CancellationToken);
             }
         }
 
@@ -122,19 +117,14 @@ namespace DuetControlServer.Commands
         private InternalCodeType _codeType;
 
         /// <summary>
-        /// Indicates if this code originates from an interceptor while in a macro file
-        /// </summary>
-        public bool IsInsertedFromMacro { get => _codeType == InternalCodeType.InsertedFromMacro; }
-
-        /// <summary>
-        /// Lock that is maintained as long as this code blocks the execution of the next code
+        /// Lock that is maintained as long as this code prevents the next code from being started
         /// </summary>
         private IDisposable _codeStartLock;
 
         /// <summary>
         /// Cancellation token that may be used to cancel this code
         /// </summary>
-        public CancellationToken CancellationToken { get; private set; }
+        public CancellationToken CancellationToken { get; set; }
 
         /// <summary>
         /// Create a task that waits until this code can be executed.
@@ -174,17 +164,12 @@ namespace DuetControlServer.Commands
                 _codeType = InternalCodeType.Macro;
                 _logger.Debug("Waiting for execution of {0} (macro code)", this);
             }
-            else if (!Flags.HasFlag(CodeFlags.IsFromFirmware) && SPI.Interface.IsWaitingForAcknowledgement(Channel))
-            {
-                _codeType = InternalCodeType.BlockingRegular;
-                _logger.Debug("Waiting for execution of {0} (acknowledgement)", this);
-            }
             else
             {
                 _codeType = InternalCodeType.Regular;
                 _logger.Debug("Waiting for execution of {0}", this);
             }
-            return _codeStartLocks[(int)Channel, (int)_codeType].LockAsync(CancellationToken);
+            return (Macro == null) ? _codeStartLocks[(int)Channel, (int)_codeType].LockAsync(CancellationToken) : Macro.WaitForCodeExecution();
         }
 
         /// <summary>
@@ -192,22 +177,25 @@ namespace DuetControlServer.Commands
         /// </summary>
         private void StartNextCode()
         {
-            _codeStartLock?.Dispose();
-            _codeStartLock = null;
+            if (_codeStartLock != null)
+            {
+                _codeStartLock.Dispose();
+                _codeStartLock = null;
+            }
         }
 
         /// <summary>
         /// Start the next available G/M/T-code and wait until this code may finish
         /// </summary>
-        /// <returns></returns>
+        /// <returns>Asynchronous task</returns>
         private AwaitableDisposable<IDisposable> WaitForFinish()
         {
-            AwaitableDisposable<IDisposable> finishingTask = _codeFinishLocks[(int)Channel, (int)_codeType].LockAsync();
+            AwaitableDisposable<IDisposable> finishTask = _codeFinishLocks[(int)Channel, (int)_codeType].LockAsync(CancellationToken);
             if (!Flags.HasFlag(CodeFlags.Unbuffered))
             {
                 StartNextCode();
             }
-            return finishingTask;
+            return finishTask;
         }
 
         /// <summary>
@@ -218,18 +206,13 @@ namespace DuetControlServer.Commands
         {
             if (_codeType == InternalCodeType.Regular || _codeType == InternalCodeType.Macro)
             {
-                int type = (int)(_codeType == InternalCodeType.Macro ? InternalCodeType.InsertedFromMacro : InternalCodeType.Inserted);
-                using (await _codeStartLocks[(int)Channel, type].LockAsync())
+                int insertedType = (int)(_codeType == InternalCodeType.Macro ? InternalCodeType.InsertedFromMacro : InternalCodeType.Inserted);
+                using (await _codeStartLocks[(int)Channel, insertedType].LockAsync(CancellationToken))
                 {
-                    using (await _codeFinishLocks[(int)Channel, type].LockAsync()) { }
+                    using (await _codeFinishLocks[(int)Channel, insertedType].LockAsync(CancellationToken)) { }
                 }
             }
         }
-
-        /// <summary>
-        /// Indicates if this code is waiting for a flush request
-        /// </summary>
-        public bool WaitingForFlush;
         #endregion
 
         /// <summary>
@@ -297,6 +280,11 @@ namespace DuetControlServer.Commands
         public bool InternallyProcessed;
 
         /// <summary>
+        /// Macro file that started this code
+        /// </summary>
+        public FileExecution.Macro Macro { get; set; }
+
+        /// <summary>
         /// Indicates if this code has been resolved by an interceptor
         /// </summary>
         public bool ResolvedByInterceptor;
@@ -313,9 +301,9 @@ namespace DuetControlServer.Commands
             {
                 // Check if this code is supposed to be written to a file
                 int numChannel = (int)Channel;
-                using (await FileLocks[numChannel].LockAsync())
+                using (await FileLocks[numChannel].LockAsync(CancellationToken))
                 {
-                    if (FilesBeingWritten[numChannel] != null && Type != CodeType.MCode && MajorNumber != 29)
+                    if (FilesBeingWritten[numChannel] != null && (Type != CodeType.MCode || MajorNumber != 29))
                     {
                         _logger.Debug("Writing {0}{1}", this, logSuffix);
                         FilesBeingWritten[numChannel].WriteLine(this);
@@ -373,7 +361,10 @@ namespace DuetControlServer.Commands
             // Attempt to process the code internally first
             if (!InternallyProcessed && await ProcessInternally())
             {
-                await CodeExecuted();
+                using (await WaitForFinish())
+                {
+                    await CodeExecuted();
+                }
                 return;
             }
 
@@ -381,7 +372,10 @@ namespace DuetControlServer.Commands
             if (Type == CodeType.Comment)
             {
                 Result = new CodeResult();
-                await CodeExecuted();
+                using (await WaitForFinish())
+                {
+                    await CodeExecuted();
+                }
                 return;
             }
 
@@ -404,22 +398,30 @@ namespace DuetControlServer.Commands
                 rrfTask = Interface.ProcessCode(this);
             }
 
-            // Start the next available code and make sure to finish this code in the right order
-            using (await WaitForFinish())
+            // Start the next code if applicable to buffer codes in RRF for greater throughput
+            if (!Flags.HasFlag(CodeFlags.Unbuffered))
             {
-                try
+                StartNextCode();
+            }
+
+            try
+            {
+                // Wait for the code to be processed by RepRapFirmware
+                Result = await rrfTask;
+                using (await WaitForFinish())
                 {
-                    // Wait for the code to be processed by RepRapFirmware
-                    Result = await rrfTask;
                     await CodeExecuted();
                 }
-                catch (OperationCanceledException)
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancelling a code clears the result
+                Result = null;
+                using (await WaitForFinish())
                 {
-                    // Cancelling a code clears the result
-                    Result = null;
                     await CodeExecuted();
-                    throw;
                 }
+                throw;
             }
         }
 
@@ -446,7 +448,10 @@ namespace DuetControlServer.Commands
             // Evaluate echo commands
             if (Keyword == KeywordType.Echo)
             {
-                await Interface.Flush(this);
+                if (!await Interface.Flush(Channel))
+                {
+                    throw new OperationCanceledException();
+                }
 
                 StringBuilder builder = new StringBuilder();
                 foreach (string expression in KeywordArgument.Split(','))
@@ -474,10 +479,13 @@ namespace DuetControlServer.Commands
                     }
                     catch (CodeParserException e)
                     {
+                        InternallyProcessed = true;
                         Result = new CodeResult(MessageType.Error, $"Failed to evaluate \"{trimmedExpression}\": {e.Message}");
                         return true;
                     }
                 }
+
+                InternallyProcessed = true;
                 Result = new CodeResult(MessageType.Success, builder.ToString());
                 return true;
             }
