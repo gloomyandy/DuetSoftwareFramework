@@ -31,7 +31,7 @@ namespace DuetControlServer.Codes
                     CodeParameter cp = code.Parameter('S', 0);
                     if (cp == 1 || cp == 3)
                     {
-                        if (await SPI.Interface.Flush(code.Channel))
+                        if (await SPI.Interface.Flush(code))
                         {
                             string file = code.Parameter('P', FilePath.DefaultHeightmapFile);
                             string physicalFile = await FilePath.ToPhysicalAsync(file, FileDirectory.System);
@@ -66,8 +66,15 @@ namespace DuetControlServer.Codes
                                     }
                                     else
                                     {
-                                        map = await SPI.Interface.GetHeightmap();
-                                        await SPI.Interface.UnlockAll(code.Channel);
+                                        try
+                                        {
+                                            map = await SPI.Interface.GetHeightmap();
+                                        }
+                                        finally
+                                        {
+                                            await SPI.Interface.UnlockAll(code.Channel);
+                                        }
+
                                         if (map.NumX * map.NumY > 0)
                                         {
                                             await map.Save(physicalFile);

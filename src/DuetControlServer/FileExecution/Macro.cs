@@ -6,7 +6,6 @@ using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading;
 using System.Threading.Tasks;
 using Code = DuetControlServer.Commands.Code;
 
@@ -57,7 +56,7 @@ namespace DuetControlServer.FileExecution
         /// <summary>
         /// List of messages written by the codes
         /// </summary>
-        public CodeResult Result { get; } = new CodeResult();
+        public CodeResult Result { get; set; } = new CodeResult();
 
         /// <summary>
         /// Internal lock used for starting codes in the right order
@@ -203,6 +202,30 @@ namespace DuetControlServer.FileExecution
         }
 
         /// <summary>
+        /// Internal TCS to resolve when the macro has finished
+        /// </summary>
+        private TaskCompletionSource<CodeResult> _finishTCS;
+
+        /// <summary>
+        /// Wait for this macro to finish asynchronously
+        /// </summary>
+        /// <returns>Code result of the finished macro</returns>
+        public Task<CodeResult> FinishAsync()
+        {
+            if (!IsExecuting)
+            {
+                return Task.FromResult(Result);
+            }
+
+            if (_finishTCS != null)
+            {
+                return _finishTCS.Task;
+            }
+            _finishTCS = new TaskCompletionSource<CodeResult>();
+            return _finishTCS.Task;
+        }
+
+        /// <summary>
         /// Method representing the lifecycle of a macro being executed
         /// </summary>
         /// <returns>Asynchronous task</returns>
@@ -218,7 +241,7 @@ namespace DuetControlServer.FileExecution
                 {
                     while (codes.Count < Settings.BufferedMacroCodes)
                     {
-                        Code readCode = ReadCode();
+                        Code readCode = await ReadCodeAsync();
                         if (readCode == null)
                         {
                             // No more codes available
@@ -238,7 +261,11 @@ namespace DuetControlServer.FileExecution
                         CodeResult result = await codeTask;
                         if (!result.IsEmpty)
                         {
-                            Result.AddRange(result);
+                            using (await _lock.LockAsync(Program.CancellationToken))
+                            {
+                                Result.AddRange(result);
+                            }
+
                             if (!IsNested)
                             {
                                 await Utility.Logger.LogOutput(result);
@@ -272,19 +299,32 @@ namespace DuetControlServer.FileExecution
                     {
                         // No more codes to process, macro file has finished
                         _logger.Debug("Finished codes from macro file {0}", Path.GetFileName(FileName));
-                        IsExecuting = false;
                     }
                     break;
                 }
             }
             while (!Program.CancellationToken.IsCancellationRequested);
+
+            // Resolve potential tasks waiting for the macro result
+            using (await _lock.LockAsync(Program.CancellationToken))
+            {
+                IsExecuting = false;
+                if (_finishTCS != null)
+                {
+                    _finishTCS.SetResult(Result);
+                    _finishTCS = null;
+                }
+            }
+
+            // Release this instance when done
+            Dispose();
         }
 
         /// <summary>
-        /// Read the next available code
+        /// Read the next available code asynchronously
         /// </summary>
-        /// <returns></returns>
-        private Code ReadCode()
+        /// <returns>Read code</returns>
+        private async Task<Code> ReadCodeAsync()
         {
             Code result;
 
@@ -321,13 +361,13 @@ namespace DuetControlServer.FileExecution
                             break;
 
                         default:
-                            result = _file?.ReadCode();
+                            result = (_file != null) ? await _file.ReadCodeAsync() : null;
                             break;
                     }
                 }
                 else
                 {
-                    result = _file?.ReadCode();
+                    result = (_file != null) ? await _file.ReadCodeAsync() : null;
                 }
 
                 // Update code information
@@ -382,6 +422,7 @@ namespace DuetControlServer.FileExecution
 
             // Dispose the used resources
             _file?.Dispose();
+            _finishTCS?.SetCanceled();
             disposed = true;
         }
     }
