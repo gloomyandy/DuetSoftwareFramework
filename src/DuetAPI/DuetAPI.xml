@@ -196,7 +196,7 @@
             <summary>
             Create a new Code instance and attempt to parse the given code string
             </summary>
-            <param name="code">G/M/T-Code</param>
+            <param name="code">UTF8-encoded G/M/T-Code</param>
         </member>
         <member name="P:DuetAPI.Commands.Code.SourceConnection">
             <summary>
@@ -282,11 +282,10 @@
             </summary>
             <seealso cref="T:DuetAPI.Commands.CodeParameter"/>
         </member>
-        <member name="M:DuetAPI.Commands.Code.Reset(System.Boolean)">
+        <member name="M:DuetAPI.Commands.Code.Reset">
             <summary>
             Reset this instance
             </summary>
-            <param name="keepLineNumber">Keep the line number</param>
         </member>
         <member name="M:DuetAPI.Commands.Code.Parameter(System.Char)">
             <summary>
@@ -323,15 +322,26 @@
             </summary>
             <returns>Command fraction of the code</returns>
         </member>
-        <member name="M:DuetAPI.Commands.Code.Parse(System.IO.TextReader,DuetAPI.Commands.Code,System.Boolean@)">
+        <member name="M:DuetAPI.Commands.Code.KeywordToString">
+            <summary>
+            Convert the keyword to a string
+            </summary>
+            <returns></returns>
+        </member>
+        <member name="M:DuetAPI.Commands.Code.Parse(System.IO.TextReader,DuetAPI.Commands.Code)">
             <summary>
             Parse the next available G/M/T-code from the given stream
             </summary>
             <param name="reader">Input to read from</param>
             <param name="result">Code to fill</param>
-            <param name="seenNewLine">If this is the first code or a NL character has been parsed</param>
             <returns>Whether anything could be read</returns>
             <exception cref="T:DuetAPI.Commands.CodeParserException">Thrown if the code contains errors like unterminated strings or unterminated comments</exception>
+            <remarks>
+            In general it is better to use <see cref="M:DuetAPI.Commands.Code.ParseAsync(System.IO.StreamReader,DuetAPI.Commands.Code,DuetAPI.Commands.CodeParserBuffer)"/> because this implementation
+            - does not update the line number unless it is specified using the 'N' character
+            - does not set the corresponding flag for G53 after the first code on a line
+            - sets the indentation level only for the first code in a line
+            </remarks>
         </member>
         <member name="M:DuetAPI.Commands.Code.AddParameter(DuetAPI.Commands.Code,System.Char,System.String,System.Boolean,System.Boolean)">
             <summary>
@@ -355,9 +365,19 @@
             </summary>
             <exception cref="T:DuetAPI.Commands.CodeParserException">Driver ID could not be parsed</exception>
         </member>
+        <member name="M:DuetAPI.Commands.Code.ParseAsync(System.IO.StreamReader,DuetAPI.Commands.Code,DuetAPI.Commands.CodeParserBuffer)">
+            <summary>
+            Parse the next available G/M/T-code from the given stream asynchronously
+            </summary>
+            <param name="reader">Input to read from</param>
+            <param name="result">Code to fill</param>
+            <param name="buffer">Internal buffer for parsing codes</param>
+            <returns>Whether anything could be read</returns>
+            <exception cref="T:DuetAPI.Commands.CodeParserException">Thrown if the code contains errors like unterminated strings or unterminated comments</exception>
+        </member>
         <member name="T:DuetAPI.Commands.KeywordType">
             <summary>
-            Types of conditional G-code
+            Enumeration of conditional G-code keywords
             </summary>
         </member>
         <member name="F:DuetAPI.Commands.KeywordType.None">
@@ -389,6 +409,7 @@
             <summary>
             Break instruction
             </summary>
+            <seealso cref="F:DuetAPI.Commands.KeywordType.While"/>
         </member>
         <member name="F:DuetAPI.Commands.KeywordType.Return">
             <summary>
@@ -414,6 +435,12 @@
             <summary>
             Echo operation
             </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.KeywordType.Continue">
+            <summary>
+            Continue instruction
+            </summary>
+            <seealso cref="F:DuetAPI.Commands.KeywordType.While"/>
         </member>
         <member name="T:DuetAPI.Commands.CodeFlags">
             <summary>
@@ -696,6 +723,70 @@
             <param name="value">Value to serialize</param>
             <param name="options">Write options</param>
         </member>
+        <member name="T:DuetAPI.Commands.CodeParserBuffer">
+            <summary>
+            Internal buffer for reading asynchronously from files
+            </summary>
+        </member>
+        <member name="M:DuetAPI.Commands.CodeParserBuffer.#ctor(System.Int32,System.Boolean)">
+            <summary>
+            Default constructor of this class
+            </summary>
+            <param name="bufferSize">How many bytes to buffer when reading from a file</param>
+            <param name="lineNumbersValid">Indicates if line numbers are valid</param>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.SeenNewLine">
+            <summary>
+            Indicates if the last 
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.Indent">
+            <summary>
+            Last indentation level
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.EnforcingAbsolutePosition">
+            <summary>
+            Whether the line started with G53
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.Buffer">
+            <summary>
+            Internal buffer
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.BufferPointer">
+            <summary>
+            Pointer in the buffer
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.BufferSize">
+            <summary>
+            How many bytes are available for reading
+            </summary>
+        </member>
+        <member name="M:DuetAPI.Commands.CodeParserBuffer.InvalidateData">
+            <summary>
+            Invalidate the buffer internally
+            </summary>
+        </member>
+        <member name="F:DuetAPI.Commands.CodeParserBuffer.LineNumber">
+            <summary>
+            Current line number
+            </summary>
+        </member>
+        <member name="M:DuetAPI.Commands.CodeParserBuffer.Invalidate">
+            <summary>
+            Invalidate the buffer
+            </summary>
+        </member>
+        <member name="M:DuetAPI.Commands.CodeParserBuffer.GetPosition(System.IO.StreamReader)">
+            <summary>
+            Get the actual byte position when reading from a stream
+            </summary>
+            <param name="reader">Reader to read from</param>
+            <returns>Actual position in bytes</returns>
+        </member>
         <member name="T:DuetAPI.Commands.CodeParserException">
             <summary>
             Exception class that is thrown when a G/M/T-code could not be parsed
@@ -718,14 +809,6 @@
             </summary>
             <param name="message">Exception message</param>
             <param name="code">Code being parsed</param>
-        </member>
-        <member name="M:DuetAPI.Commands.CodeParserException.#ctor(System.String,DuetAPI.Commands.Code,System.Exception)">
-            <summary>
-            Creates a new CodeParserException with details where the parser failed to read data
-            </summary>
-            <param name="message">Exception message</param>
-            <param name="code">Code being parsed</param>
-            <param name="inner">Inner exception</param>
         </member>
         <member name="M:DuetAPI.Commands.CodeParserException.#ctor(System.String,System.Exception)">
             <summary>
@@ -1852,12 +1935,12 @@
         </member>
         <member name="P:DuetAPI.Machine.FanThermostaticControl.HighTemperature">
             <summary>
-            Upper temperature range required to turn on the fan on (in C)
+            Upper temperature range required to turn on the fan (in C)
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.FanThermostaticControl.LowTemperature">
             <summary>
-            Lower temperature range required to turn on the fan on (in C)
+            Lower temperature range required to turn on the fan (in C)
             </summary>
         </member>
         <member name="T:DuetAPI.Machine.Heat">
@@ -1916,7 +1999,7 @@
         </member>
         <member name="P:DuetAPI.Machine.Heater.Max">
             <summary>
-            Maximum allowed temperature for this heater (in C)
+            Maximum temperature allowed for this heater (in C)
             </summary>
             <remarks>
             This is only temporary and should be replaced by a representation of the heater protection as in RRF
@@ -1924,7 +2007,7 @@
         </member>
         <member name="P:DuetAPI.Machine.Heater.Min">
             <summary>
-            Maximum allowed temperature for this heater (in C)
+            Minimum temperature allowed for this heater (in C)
             </summary>
             <remarks>
             This is only temporary and should be replaced by a representation of the heater protection as in RRF
@@ -1967,7 +2050,7 @@
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.DeadTime">
             <summary>
-            Dead time of this heater or null if unknown
+            Dead time
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.Enabled">
@@ -1977,7 +2060,7 @@
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.Gain">
             <summary>
-            Gain value or null if unknown
+            Gain value
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.Inverted">
@@ -1987,7 +2070,7 @@
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.MaxPwm">
             <summary>
-            Maximum PWM or null if unknown
+            Maximum PWM value
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.PID">
@@ -1997,12 +2080,12 @@
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.StandardVoltage">
             <summary>
-            Standard voltage of this heater or null if unknown
+            Standard voltage or null if unknown
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.HeaterModel.TimeConstant">
             <summary>
-            Time constant or null if unknown
+            Time constant
             </summary>
         </member>
         <member name="T:DuetAPI.Machine.HeaterModelPID">
@@ -2314,7 +2397,7 @@
         </member>
         <member name="P:DuetAPI.Machine.InputChannel.State">
             <summary>
-            Number of the current line
+            State of this input channel
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.InputChannel.LineNumber">
@@ -2577,7 +2660,7 @@
         </member>
         <member name="P:DuetAPI.Machine.Layer.Duration">
             <summary>
-            Duration of the layer (in s or null if unknown)
+            Duration of the layer (in s)
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.Layer.Filament">
@@ -2637,7 +2720,7 @@
         </member>
         <member name="P:DuetAPI.Machine.ParsedFileInfo.NumLayers">
             <summary>
-            Number of total layers or null if unknown
+            Number of total layers or 0 if unknown
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.ParsedFileInfo.PrintTime">
@@ -3043,6 +3126,11 @@
             Whether the axis maximum was probed
             </summary>
         </member>
+        <member name="P:DuetAPI.Machine.Axis.Microstepping">
+            <summary>
+            Microstepping configuration
+            </summary>
+        </member>
         <member name="P:DuetAPI.Machine.Axis.Min">
             <summary>
             Minimum travel of this axis (in mm)
@@ -3056,6 +3144,11 @@
         <member name="P:DuetAPI.Machine.Axis.Speed">
             <summary>
             Maximum speed (in mm/s)
+            </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.Axis.StepsPerMm">
+            <summary>
+            Number of microsteps per mm
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.Axis.UserPosition">
@@ -3156,6 +3249,11 @@
             Motor jerk (in mm/s)
             </summary>
         </member>
+        <member name="P:DuetAPI.Machine.Extruder.Microstepping">
+            <summary>
+            Microstepping configuration
+            </summary>
+        </member>
         <member name="P:DuetAPI.Machine.Extruder.Nonlinear">
             <summary>
             Nonlinear extrusion parameters (see M592)
@@ -3163,22 +3261,27 @@
         </member>
         <member name="P:DuetAPI.Machine.Extruder.Position">
             <summary>
-            Extruder position
+            Extruder position (in mm)
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.Extruder.PressureAdvance">
             <summary>
-            Motor jerk (in mm/s)
+            Pressure advance
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.Extruder.RawPosition">
             <summary>
-            Raw extruder position without extrusion factor applied
+            Raw extruder position without extrusion factor applied (in mm)
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.Extruder.Speed">
             <summary>
             Maximum speed (in mm/s)
+            </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.Extruder.StepsPerMm">
+            <summary>
+            Number of microsteps per mm
             </summary>
         </member>
         <member name="T:DuetAPI.Machine.ExtruderNonlinear">
@@ -3288,7 +3391,7 @@
         </member>
         <member name="T:DuetAPI.Machine.HangprinterKinematics">
             <summary>
-            Information about core kinematics
+            Information about hangprinter kinematics
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.HangprinterKinematics.AnchorA">
@@ -3333,12 +3436,14 @@
             <param name="name">Kinematics name</param>
             <returns>Required type</returns>
         </member>
-        <member name="M:DuetAPI.Machine.Kinematics.UpdateFromJson(System.Text.Json.JsonElement)">
+        <member name="M:DuetAPI.Machine.Kinematics.UpdateFromJson(System.Text.Json.JsonElement,System.Boolean)">
             <summary>
-            Update this instance from a given JSON object
+            Update this instance from a given JSON element
             </summary>
-            <param name="jsonElement">JSON object</param>
+            <param name="jsonElement">Element to update this intance from</param>
+            <param name="ignoreSbcProperties">Whether SBC properties are ignored</param>
             <returns>Updated instance</returns>
+            <exception cref="T:System.Text.Json.JsonException">Failed to deserialize data</exception>
         </member>
         <member name="T:DuetAPI.Machine.KinematicsName">
             <summary>
@@ -3431,6 +3536,21 @@
             <param name="writer">JSON writer</param>
             <param name="value">Value to serialize</param>
             <param name="options">Write options</param>
+        </member>
+        <member name="T:DuetAPI.Machine.Microstepping">
+            <summary>
+            Microstepping configuration
+            </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.Microstepping.Interpolated">
+            <summary>
+            Indicates if the stepper driver uses interpolation
+            </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.Microstepping.Value">
+            <summary>
+            Microsteps per full step
+            </summary>
         </member>
         <member name="T:DuetAPI.Machine.MotorsIdleControl">
             <summary>
@@ -4020,12 +4140,14 @@
             <param name="type">Filament monitor type</param>
             <returns>Required type</returns>
         </member>
-        <member name="M:DuetAPI.Machine.FilamentMonitor.UpdateFromJson(System.Text.Json.JsonElement)">
+        <member name="M:DuetAPI.Machine.FilamentMonitor.UpdateFromJson(System.Text.Json.JsonElement,System.Boolean)">
             <summary>
-            Update this instance from a given JSON object
+            Update this instance from a given JSON element
             </summary>
-            <param name="jsonElement">JSON object</param>
+            <param name="jsonElement">Element to update this intance from</param>
+            <param name="ignoreSbcProperties">Whether SBC properties are ignored</param>
             <returns>Updated instance</returns>
+            <exception cref="T:System.Text.Json.JsonException">Failed to deserialize data</exception>
         </member>
         <member name="T:DuetAPI.Machine.FilamentMonitorType">
             <summary>
@@ -4247,6 +4369,11 @@
             Information about a rotating magnet filament monitor
             </summary>
         </member>
+        <member name="M:DuetAPI.Machine.RotatingMagnetFilamentMonitor.#ctor">
+            <summary>
+            Constructor of this class
+            </summary>
+        </member>
         <member name="P:DuetAPI.Machine.RotatingMagnetFilamentMonitor.Calibrated">
             <summary>
             Calibrated properties of this filament monitor
@@ -4262,14 +4389,9 @@
             Details about a general-purpose input port
             </summary>
         </member>
-        <member name="P:DuetAPI.Machine.GpInputPort.Configured">
-            <summary>
-            Indicates if the port has been configured
-            </summary>
-        </member>
         <member name="P:DuetAPI.Machine.GpInputPort.Value">
             <summary>
-            Value of this port or null if it is not configured
+            Value of this port (0..1)
             </summary>
         </member>
         <member name="T:DuetAPI.Machine.Probe">
@@ -4435,11 +4557,11 @@
         </member>
         <member name="P:DuetAPI.Machine.Sensors.FilamentMonitors">
             <summary>
-            List of configured endstops
+            List of configured filament monitors
             </summary>
             <seealso cref="T:DuetAPI.Machine.FilamentMonitor"/>
         </member>
-        <member name="P:DuetAPI.Machine.Sensors.Inputs">
+        <member name="P:DuetAPI.Machine.Sensors.GpIn">
             <summary>
             List of general-purpose input ports
             </summary>
@@ -4499,6 +4621,16 @@
         <member name="P:DuetAPI.Machine.BeepRequest.Frequency">
             <summary>
             Frequency of the requested beep (in Hz)
+            </summary>
+        </member>
+        <member name="T:DuetAPI.Machine.GpOutputPort">
+            <summary>
+            Details about a general-purpose output port
+            </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.GpOutputPort.Pwm">
+            <summary>
+            PWM value of this port (0..1)
             </summary>
         </member>
         <member name="T:DuetAPI.Machine.MachineMode">
@@ -4651,7 +4783,7 @@
         </member>
         <member name="P:DuetAPI.Machine.RestorePoint.Coords">
             <summary>
-            Axis coordinates of the the restore point (in mm)
+            Axis coordinates of the restore point (in mm)
             </summary>
         </member>
         <member name="P:DuetAPI.Machine.RestorePoint.ExtruderPos">
@@ -4713,6 +4845,12 @@
             <summary>
             Version of the Duet Software Framework package
             </summary>
+        </member>
+        <member name="P:DuetAPI.Machine.State.GpOut">
+            <summary>
+            List of general-purpose output ports
+            </summary>
+            <seealso cref="T:DuetAPI.Machine.GpOutputPort"/>
         </member>
         <member name="P:DuetAPI.Machine.State.LaserPwm">
             <summary>
@@ -5096,16 +5234,26 @@
             Helper class to generate RRF-style file lists
             </summary>
         </member>
-        <member name="M:DuetAPI.Utility.FileLists.MakeFileListContainer(System.Object,System.String,System.Int32)">
+        <member name="M:DuetAPI.Utility.FileLists.MakeFileListContainer(System.Collections.IList,System.String,System.Int32,System.Boolean)">
             <summary>
             Make a filelist container for M20
             </summary>
             <param name="items">Items to include</param>
             <param name="directory">RRF directory</param>
             <param name="startAt">First item</param>
+            <param name="finished">True if the file list is complete</param>
             <returns>JSON file list object</returns>
         </member>
-        <member name="M:DuetAPI.Utility.FileLists.GetFiles(System.String,System.String,System.Int32,System.Boolean)">
+        <member name="M:DuetAPI.Utility.FileLists.GetFileListSize(System.Collections.IList,System.String,System.Int32)">
+            <summary>
+            Get an estimate how big the UTF8-encoded file list will be in bytes
+            </summary>
+            <param name="items">Items to include</param>
+            <param name="directory">RRF directory</param>
+            <param name="startAt">First item</param>
+            <returns>Size of the UTF8-encoded file list in bytes</returns>
+        </member>
+        <member name="M:DuetAPI.Utility.FileLists.GetFiles(System.String,System.String,System.Int32,System.Boolean,System.Int32)">
             <summary>
             Get a /rr_files or M20 files response
             </summary>
@@ -5113,15 +5261,17 @@
             <param name="physicalDirectory">Physical directory</param>
             <param name="startAt">First item to send</param>
             <param name="flagDirs">Prefix directories with an asterisk</param>
+            <param name="maxSize">Maximum size of the file list in bytes or -1 if unset</param>
             <returns>JSON file list</returns>
         </member>
-        <member name="M:DuetAPI.Utility.FileLists.GetFileList(System.String,System.String,System.Int32)">
+        <member name="M:DuetAPI.Utility.FileLists.GetFileList(System.String,System.String,System.Int32,System.Int32)">
             <summary>
             Get a /rr_filelist or M20 files response
             </summary>
             <param name="directory">RRF path to the directory</param>
             <param name="physicalDirectory">Physical directory</param>
             <param name="startAt">First file index to return. Set startAt to -1 to omit error handling and the JSON object container</param>
+            <param name="maxSize">Maximum size of the file list in bytes or -1 if unset</param>
             <returns>JSON list</returns>
         </member>
         <member name="T:DuetAPI.Utility.Heightmap">
@@ -5310,6 +5460,11 @@
             Default JSON (de-)serialization options
             </summary>
         </member>
+        <member name="F:DuetAPI.Utility.JsonHelper.DefaultJsonOptionsNoConverters">
+            <summary>
+            Default JSON (de-)serialization options without converters
+            </summary>
+        </member>
         <member name="M:DuetAPI.Utility.JsonHelper.ReceiveUtf8Json(System.Net.Sockets.Socket,System.Threading.CancellationToken)">
             <summary>
             Receive a serialized JSON object from a socket in UTF-8 format
@@ -5368,6 +5523,29 @@
             </summary>
             <param name="writer">JSON writer</param>
             <param name="value">Value to write</param>
+            <param name="options">Write options</param>
+        </member>
+        <member name="T:DuetAPI.Utility.JsonPolymorphicWriteOnlyConverter`1">
+            <summary>
+            JSON converter for converting inherited class types to JSON
+            </summary>
+            <typeparam name="T"></typeparam>
+        </member>
+        <member name="M:DuetAPI.Utility.JsonPolymorphicWriteOnlyConverter`1.Read(System.Text.Json.Utf8JsonReader@,System.Type,System.Text.Json.JsonSerializerOptions)">
+            <summary>
+            Read from JSON
+            </summary>
+            <param name="reader">JSON reader</param>
+            <param name="typeToConvert">Type to convert</param>
+            <param name="options">Read options</param>
+            <returns>Read value</returns>
+        </member>
+        <member name="M:DuetAPI.Utility.JsonPolymorphicWriteOnlyConverter`1.Write(System.Text.Json.Utf8JsonWriter,`0,System.Text.Json.JsonSerializerOptions)">
+            <summary>
+            Write a CodeParameter to JSON
+            </summary>
+            <param name="writer">JSON writer</param>
+            <param name="value">Value to serialize</param>
             <param name="options">Write options</param>
         </member>
     </members>

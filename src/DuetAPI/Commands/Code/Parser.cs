@@ -17,20 +17,24 @@ namespace DuetAPI.Commands
         /// </summary>
         /// <param name="reader">Input to read from</param>
         /// <param name="result">Code to fill</param>
-        /// <param name="seenNewLine">If this is the first code or a NL character has been parsed</param>
         /// <returns>Whether anything could be read</returns>
         /// <exception cref="CodeParserException">Thrown if the code contains errors like unterminated strings or unterminated comments</exception>
-        public static bool Parse(TextReader reader, Code result, ref bool seenNewLine)
+        /// <remarks>
+        /// In general it is better to use <see cref="ParseAsync(StreamReader, Code, CodeParserBuffer)"/> because this implementation
+        /// - does not update the line number unless it is specified using the 'N' character
+        /// - does not set the corresponding flag for G53 after the first code on a line
+        /// - sets the indentation level only for the first code in a line
+        /// </remarks>
+        public static bool Parse(TextReader reader, Code result)
         {
             char letter = '\0', c;
             string value = string.Empty;
 
             bool contentRead = false, unprecedentedParameter = false;
             bool inFinalComment = false, inEncapsulatedComment = false, inChunk = false, inQuotes = false, inExpression = false, inCondition = false;
-            bool readingAtStart = seenNewLine, isLineNumber = false, hadLineNumber = false, isNumericParameter = false, endingChunk = false;
+            bool readingAtStart = true, isLineNumber = false, isNumericParameter = false, endingChunk = false;
             bool wasQuoted = false, wasCondition = false, wasExpression = false;
             int numCurlyBraces = 0, numRoundBraces = 0;
-            seenNewLine = false;
 
             Encoding encoding = (reader is StreamReader sr) ? sr.CurrentEncoding : Encoding.UTF8;
             result.Length = 0;
@@ -45,11 +49,6 @@ namespace DuetAPI.Commands
                 {
                     // Ignore CR
                     continue;
-                }
-                if (currentChar == '\n' && !hadLineNumber && result.LineNumber != null)
-                {
-                    // Keep track of the line number (if possible)
-                    result.LineNumber++;
                 }
 
                 if (inFinalComment)
@@ -284,12 +283,11 @@ namespace DuetAPI.Commands
                         if (isLineNumber)
                         {
                             // Process line number
-                            if (int.TryParse(value, out int lineNumber))
+                            if (long.TryParse(value, out long lineNumber))
                             {
                                 result.LineNumber = lineNumber;
                             }
                             isLineNumber = false;
-                            hadLineNumber = true;
                         }
                         else if ((upperLetter == 'G' || upperLetter == 'M' || upperLetter == 'T') &&
                                  (result.MajorNumber == null || (result.Type == CodeType.GCode && result.MajorNumber == 53)))
@@ -361,6 +359,11 @@ namespace DuetAPI.Commands
                             else if (letter == 'b' && value == "reak")
                             {
                                 result.Keyword = KeywordType.Break;
+                                inCondition = true;
+                            }
+                            else if (letter == 'c' && value == "ontinue")
+                            {
+                                result.Keyword = KeywordType.Continue;
                                 inCondition = true;
                             }
                             else if (letter == 'r' && value == "eturn")
@@ -464,7 +467,6 @@ namespace DuetAPI.Commands
                     }
                 }
             } while (c != '\n');
-            seenNewLine |= (c == '\n');
 
             // Do not allow malformed codes
             if (inEncapsulatedComment)

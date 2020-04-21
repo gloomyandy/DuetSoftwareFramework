@@ -20,9 +20,9 @@ namespace DuetControlServer.Commands
         private static readonly AsyncLock[] _channelLocks = new AsyncLock[Inputs.Total];
 
         /// <summary>
-        /// Initialize this class
+        /// Static constructor of this class
         /// </summary>
-        public static void Init()
+        static SimpleCode()
         {
             for (int i = 0; i < Inputs.Total; i++)
             {
@@ -36,33 +36,27 @@ namespace DuetControlServer.Commands
         public int SourceConnection { get; set; }
 
         /// <summary>
-        /// Parse codes from the given input string
+        /// Parse codes from the given input string asynchronously
         /// </summary>
         /// <returns>Parsed G/M/T-codes</returns>
-        public IEnumerable<Code> Parse()
+        public async IAsyncEnumerable<Code> ParseAsync()
         {
             using MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(Code));
             using StreamReader reader = new StreamReader(stream);
+            CodeParserBuffer buffer = new CodeParserBuffer((int)stream.Length, Code.Contains('\n'));
 
-            bool seenNewLine = true, enforcingAbsolutePositions = false;
-            byte indent = 0;
-            while (!reader.EndOfStream)
+            while (buffer.GetPosition(reader) < stream.Length)
             {
                 Code code = new Code()
                 {
                     Channel = Channel,
-                    Flags = enforcingAbsolutePositions ? CodeFlags.EnforceAbsolutePosition : CodeFlags.None,
-                    Indent = indent,
                     SourceConnection = SourceConnection
                 };
 
-                if (DuetAPI.Commands.Code.Parse(reader, code, ref seenNewLine))
+                if (await DuetAPI.Commands.Code.ParseAsync(reader, code, buffer))
                 {
                     yield return code;
                 }
-
-                enforcingAbsolutePositions = seenNewLine ? false : code.Flags.HasFlag(CodeFlags.EnforceAbsolutePosition);
-                indent = seenNewLine ? (byte)0 : code.Indent;
             }
         }
 
@@ -77,7 +71,7 @@ namespace DuetControlServer.Commands
             List<Code> codes = new List<Code>(), priorityCodes = new List<Code>();
             try
             {
-                foreach (Code code in Parse())
+                await foreach (Code code in ParseAsync())
                 {
                     // M108, M112, M122, and M999 always go to an idle channel so we (hopefully) get a low-latency response
                     if (code.Type == CodeType.MCode && (code.MajorNumber == 108 || code.MajorNumber == 112 || code.MajorNumber == 122 || code.MajorNumber == 999))
@@ -110,9 +104,16 @@ namespace DuetControlServer.Commands
                 foreach (Code priorityCode in priorityCodes)
                 {
                     CodeResult codeResult = await priorityCode.Execute();
-                    if (codeResult != null)
+                    try
                     {
-                        result.AddRange(codeResult);
+                        if (codeResult != null)
+                        {
+                            result.AddRange(codeResult);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // not logged
                     }
                 }
 
@@ -130,10 +131,17 @@ namespace DuetControlServer.Commands
 
                     foreach (Task<CodeResult> codeTask in codeTasks)
                     {
-                        CodeResult codeResult = await codeTask;
-                        if (codeResult != null)
+                        try
                         {
-                            result.AddRange(codeResult);
+                            CodeResult codeResult = await codeTask;
+                            if (codeResult != null)
+                            {
+                                result.AddRange(codeResult);
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // not logged
                         }
                     }
                 }
@@ -141,11 +149,6 @@ namespace DuetControlServer.Commands
             catch (CodeParserException cpe)
             {
                 result.Add(MessageType.Error, cpe.Message);
-            }
-            catch (OperationCanceledException)
-            {
-                // Report when a code is cancelled
-                result.Add(MessageType.Error, "Code has been cancelled");
             }
             return result.ToString();
         }

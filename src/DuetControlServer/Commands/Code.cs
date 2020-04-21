@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using DuetAPI;
@@ -7,6 +8,7 @@ using DuetAPI.Commands;
 using DuetAPI.Connection;
 using DuetAPI.Machine;
 using DuetControlServer.Codes;
+using DuetControlServer.FileExecution;
 using DuetControlServer.IPC.Processors;
 using DuetControlServer.Model;
 using DuetControlServer.SPI;
@@ -71,9 +73,9 @@ namespace DuetControlServer.Commands
         private static readonly CancellationTokenSource[] _cancellationTokenSources = new CancellationTokenSource[Inputs.Total];
 
         /// <summary>
-        /// Initialize the code scheduler
+        /// Static constructor of this class
         /// </summary>
-        public static void Init()
+        static Code()
         {
             for (int i = 0; i < Inputs.Total; i++)
             {
@@ -139,9 +141,10 @@ namespace DuetControlServer.Commands
             Code codeBeingIntercepted = Interception.GetCodeBeingIntercepted(SourceConnection);
             if (codeBeingIntercepted != null)
             {
-                if (codeBeingIntercepted.Macro != null)
+                if (codeBeingIntercepted.Flags.HasFlag(CodeFlags.IsFromMacro))
                 {
                     Flags |= CodeFlags.IsFromMacro;
+                    File = codeBeingIntercepted.File;
                     Macro = codeBeingIntercepted.Macro;
                 }
                 return Task.FromResult<IDisposable>(null);
@@ -160,7 +163,7 @@ namespace DuetControlServer.Commands
             {
                 _codeType = InternalCodeType.Macro;
                 _logger.Debug("Waiting for execution of {0} (macro code)", this);
-                return (Macro == null) ? _codeStartLocks[(int)Channel, (int)InternalCodeType.Macro].LockAsync(CancellationToken) : Macro.WaitForCodeExecution();
+                return (Macro == null) ? _codeStartLocks[(int)Channel, (int)InternalCodeType.Macro].LockAsync(CancellationToken) : Macro.WaitForCodeStart();
             }
 
             // Wait for pending codes for message acknowledgements
@@ -266,9 +269,17 @@ namespace DuetControlServer.Commands
             Task<CodeResult> executingTask = WaitForExecution()
                 .ContinueWith(async task =>
                 {
-                    _codeStartLock = await task;
-                    return await ExecuteInternally();
-                })
+                    try
+                    {
+                        _codeStartLock = await task;
+                        return await ExecuteInternally();
+                    }
+                    catch
+                    {
+                        IsExecuted = true;
+                        throw;
+                    }
+                }, TaskContinuationOptions.RunContinuationsAsynchronously)
                 .Unwrap();
 
             // Return either the task itself or null and let it finish in the background
@@ -281,9 +292,14 @@ namespace DuetControlServer.Commands
         public bool InternallyProcessed;
 
         /// <summary>
-        /// Macro file that started this code
+        /// File that started this code
         /// </summary>
-        public FileExecution.Macro Macro { get; set; }
+        public Files.CodeFile File;
+
+        /// <summary>
+        /// Macro that started this code or null
+        /// </summary>
+        public Macro Macro;
 
         /// <summary>
         /// Indicates if this code has been resolved by an interceptor
@@ -349,6 +365,7 @@ namespace DuetControlServer.Commands
             {
                 // Make sure the next code is started no matter what happened before
                 StartNextCode();
+                IsExecuted = true;
             }
             return Result;
         }
@@ -370,7 +387,7 @@ namespace DuetControlServer.Commands
             }
 
             // Comments are resolved in DCS but they may be interpreted by third-party plugins
-            if (Type == CodeType.Comment)
+            if (Keyword == KeywordType.None && Type == CodeType.Comment)
             {
                 Result = new CodeResult();
                 using (await WaitForFinish())
@@ -414,8 +431,10 @@ namespace DuetControlServer.Commands
                     await CodeExecuted();
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException oce)
             {
+                _logger.Trace(oce, "Code {0} cancelled", this);
+
                 // Cancelling a code clears the result
                 Result = null;
                 using (await WaitForFinish())
@@ -432,10 +451,10 @@ namespace DuetControlServer.Commands
         /// <returns>Whether the code could be processed internally</returns>
         private async Task<bool> ProcessInternally()
         {
-            if (Keyword != KeywordType.None && Keyword != KeywordType.Echo)
+            if (Keyword != KeywordType.None && Keyword != KeywordType.Echo && Keyword != KeywordType.Abort && Keyword != KeywordType.Return)
             {
                 // Other meta keywords must be handled before we get here...
-                throw new InvalidOperationException();
+                throw new InvalidOperationException("Conditional codes must not be executed");
             }
 
             // Pre-process this code
@@ -451,7 +470,7 @@ namespace DuetControlServer.Commands
                 }
             }
 
-            // Expand Linux expressions
+            // Populate Linux expressions in G/M/T-codes
             if (Keyword == KeywordType.None && Expressions.ContainsLinuxFields(this))
             {
                 if (!await Interface.Flush(this))
@@ -496,8 +515,8 @@ namespace DuetControlServer.Commands
                 }
             }
 
-            // Evaluate echo
-            if (Keyword == KeywordType.Echo)
+            // Evaluate echo, abort, and return
+            if (Keyword == KeywordType.Echo || Keyword == KeywordType.Abort || Keyword == KeywordType.Return)
             {
                 if (!await Interface.Flush(this))
                 {
@@ -514,6 +533,16 @@ namespace DuetControlServer.Commands
             // Code has not been interpreted yet - let RRF deal with it
             return false;
         }
+
+        /// <summary>
+        /// Indicates if the code has been finished
+        /// </summary>
+        public bool IsExecuted
+        {
+            get => _isExecuted;
+            set => _isExecuted = value;
+        }
+        private volatile bool _isExecuted;
 
         /// <summary>
         /// Executed when the code has finished
@@ -579,6 +608,23 @@ namespace DuetControlServer.Commands
                         {
                             Result.Add(MessageType.Success, "\n");
                         }
+                    }
+                }
+
+                // Update the last code result
+                if (File != null)
+                {
+                    if (Result.Any(message => message.Type == MessageType.Error))
+                    {
+                        File.LastResult = 2;
+                    }
+                    else if (Result.Any(message => message.Type == MessageType.Warning))
+                    {
+                        File.LastResult = 1;
+                    }
+                    else
+                    {
+                        File.LastResult = 0;
                     }
                 }
 

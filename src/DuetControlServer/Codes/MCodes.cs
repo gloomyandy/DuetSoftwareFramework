@@ -31,6 +31,12 @@ namespace DuetControlServer.Codes
         /// <returns>Result of the code if the code completed, else null</returns>
         public static async Task<CodeResult> Process(Commands.Code code)
         {
+            if (code.Channel == CodeChannel.File && FileExecution.Job.IsSimulating)
+            {
+                // Ignore M-codes from files in simulation mode...
+                return null;
+            }
+
             switch (code.MajorNumber)
             {
                 // Stop or Unconditional stop
@@ -51,7 +57,7 @@ namespace DuetControlServer.Codes
 
                                 // Invalidate the print file and make sure no more codes are read from it
                                 code.CancellingPrint = true;
-                                FileExecution.Job.Cancel();
+                                await FileExecution.Job.Cancel();
                             }
                         }
                         break;
@@ -62,20 +68,35 @@ namespace DuetControlServer.Codes
                 case 20:
                     if (await SPI.Interface.Flush(code))
                     {
-                        CodeParameter pParam = code.Parameter('P');
-                        string directory = await FilePath.ToPhysicalAsync(pParam ?? "", FileDirectory.GCodes);
-                        int startAt = Math.Max(code.Parameter('R') ?? 0, 0);
+                        // Resolve the directory
+                        string virtualDirectory = code.Parameter('P');
+                        if (virtualDirectory == null)
+                        {
+                            using (await Model.Provider.AccessReadOnlyAsync())
+                            {
+                                virtualDirectory = Model.Provider.Get.Directories.GCodes;
+                            }
+                        }
+                        string physicalDirectory = await FilePath.ToPhysicalAsync(virtualDirectory);
+
+                        // Make sure to stay within limits if it is a request from the firmware
+                        int maxSize = -1;
+                        if (code.Flags.HasFlag(CodeFlags.IsFromFirmware))
+                        {
+                            maxSize = SPI.Communication.Consts.MaxMessageLength;
+                        }
 
                         // Check if JSON file lists were requested
+                        int startAt = Math.Max(code.Parameter('R') ?? 0, 0);
                         CodeParameter sParam = code.Parameter('S', 0);
                         if (sParam == 2)
                         {
-                            string json = FileLists.GetFiles(pParam, directory, startAt);
+                            string json = FileLists.GetFiles(virtualDirectory, physicalDirectory, startAt, true, maxSize);
                             return new CodeResult(MessageType.Success, json);
                         }
                         if (sParam == 3)
                         {
-                            string json = FileLists.GetFileList(pParam, directory, startAt);
+                            string json = FileLists.GetFileList(virtualDirectory, physicalDirectory, startAt, maxSize);
                             return new CodeResult(MessageType.Success, json);
                         }
 
@@ -98,7 +119,7 @@ namespace DuetControlServer.Codes
 
                         int numItems = 0;
                         bool itemFound = false;
-                        foreach (string file in Directory.EnumerateFileSystemEntries(directory))
+                        foreach (string file in Directory.EnumerateFileSystemEntries(physicalDirectory))
                         {
                             if (numItems++ >= startAt)
                             {
@@ -206,7 +227,7 @@ namespace DuetControlServer.Codes
                             CodeParameter sParam = code.Parameter('S');
                             if (sParam != null)
                             {
-                                FileExecution.Job.FilePosition = sParam;
+                                await FileExecution.Job.SetFilePosition(sParam);
                             }
                         }
 
@@ -224,7 +245,8 @@ namespace DuetControlServer.Codes
                         {
                             if (FileExecution.Job.IsFileSelected)
                             {
-                                return new CodeResult(MessageType.Success, $"SD printing byte {FileExecution.Job.FilePosition}/{FileExecution.Job.FileLength}");
+                                long filePosition = await FileExecution.Job.GetFilePosition();
+                                return new CodeResult(MessageType.Success, $"SD printing byte {filePosition}/{FileExecution.Job.FileLength}");
                             }
                             return new CodeResult(MessageType.Success, "Not SD printing.");
                         }
@@ -319,7 +341,7 @@ namespace DuetControlServer.Codes
                     {
                         if (await SPI.Interface.Flush(code))
                         {
-                            string file = await FilePath.ToPhysicalAsync(code.GetUnprecedentedString());
+                            string file = await FilePath.ToPhysicalAsync(code.GetUnprecedentedString(), FileDirectory.GCodes);
                             try
                             {
                                 ParsedFileInfo info = await InfoParser.Parse(file);
