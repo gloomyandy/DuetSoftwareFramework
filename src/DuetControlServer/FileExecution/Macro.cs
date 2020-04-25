@@ -86,6 +86,11 @@ namespace DuetControlServer.FileExecution
         private readonly AsyncLock _codeStartLock = new AsyncLock();
 
         /// <summary>
+        /// Internal lock used for starting codes in the right order
+        /// </summary>
+        private readonly AsyncLock _codeFinishLock = new AsyncLock();
+
+        /// <summary>
         /// Method to wait until a new code can be started in the right order
         /// </summary>
         /// <returns>Disposable lock</returns>
@@ -93,6 +98,15 @@ namespace DuetControlServer.FileExecution
         /// This is required in case a flush is requested before another nested macro is started
         /// </remarks>
         public AwaitableDisposable<IDisposable> WaitForCodeStart() => _codeStartLock.LockAsync(CancellationToken);
+
+        /// <summary>
+        /// Method to wait until a new code can be finished in the right order
+        /// </summary>
+        /// <returns>Disposable lock</returns>
+        /// <remarks>
+        /// This is required in case a flush is requested before another nested macro is started
+        /// </remarks>
+        public AwaitableDisposable<IDisposable> WaitForCodeFinish() => _codeFinishLock.LockAsync(CancellationToken);
 
         /// <summary>
         /// File to read from
@@ -211,7 +225,7 @@ namespace DuetControlServer.FileExecution
                 return;
             }
             IsAborted = true;
-            IsExecuting = false;
+
             if (_file != null)
             {
                 using (await _file.LockAsync())
@@ -232,6 +246,9 @@ namespace DuetControlServer.FileExecution
         /// Wait for this macro to finish asynchronously
         /// </summary>
         /// <returns>Code result of the finished macro</returns>
+        /// <remarks>
+        /// This task is always resolved and never cancelled
+        /// </remarks>
         public Task<CodeResult> FinishAsync()
         {
             if (!IsExecuting)
@@ -326,25 +343,17 @@ namespace DuetControlServer.FileExecution
                     {
                         // Code has been cancelled, don't log this. In the future this may terminate the macro file
                     }
+                    catch (CodeParserException cpe)
+                    {
+                        await Logger.LogOutput(MessageType.Error, cpe.Message + " of " + Path.GetFileName(FileName));
+                    }
                     catch (AggregateException ae)
                     {
-                        using (await _lock.LockAsync(Program.CancellationToken))
-                        {
-                            await Abort();
-                        }
-
                         await Logger.LogOutput(MessageType.Error, $"Failed to execute {code.ToShortString()} in {Path.GetFileName(FileName)}: [{ae.InnerException.GetType().Name}] {ae.InnerException.Message}");
-                        _logger.Error(ae.InnerException, "Failed execute code from macro {0}", FileName);
                     }
                     catch (Exception e)
                     {
-                        using (await _lock.LockAsync(Program.CancellationToken))
-                        {
-                            await Abort();
-                        }
-
                         await Logger.LogOutput(MessageType.Error, $"Failed to execute {code.ToShortString()} in {Path.GetFileName(FileName)}: [{e.GetType().Name}] {e.Message}");
-                        _logger.Error(e, "Failed execute code from macro {0}", FileName);
                     }
                 }
                 else
@@ -360,6 +369,10 @@ namespace DuetControlServer.FileExecution
             using (await _lock.LockAsync(Program.CancellationToken))
             {
                 IsExecuting = false;
+                if (!IsAborted)
+                {
+                    _logger.Info("Finished macro file {0}", FileName);
+                }
                 if (_finishTCS != null)
                 {
                     _finishTCS.SetResult(Result);

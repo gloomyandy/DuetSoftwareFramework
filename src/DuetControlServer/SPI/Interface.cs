@@ -197,7 +197,7 @@ namespace DuetControlServer.SPI
         /// </summary>
         /// <param name="code">Code to execute</param>
         /// <returns>Asynchronous task</returns>
-        public static Task<CodeResult> ProcessCode(Code code)
+        public static async Task ProcessCode(Code code)
         {
             if (code.Type == CodeType.MCode && code.MajorNumber == 703)
             {
@@ -206,9 +206,9 @@ namespace DuetControlServer.SPI
                 _assignFilaments = true;
             }
 
-            using (_channels[code.Channel].Lock())
+            using (await _channels[code.Channel].LockAsync())
             {
-                return _channels[code.Channel].ProcessCode(code);
+                _channels[code.Channel].ProcessCode(code);
             }
         }
 
@@ -466,7 +466,7 @@ namespace DuetControlServer.SPI
             }
             if (message.Length > Consts.MaxMessageLength)
             {
-                throw new ArgumentException("message too long");
+                throw new ArgumentException($"{nameof(message)} too long");
             }
 
             lock (_messagesToSend)
@@ -474,13 +474,6 @@ namespace DuetControlServer.SPI
                 _messagesToSend.Enqueue(new Tuple<MessageTypeFlags, string>(flags, message));
             }
         }
-
-        /// <summary>
-        /// Initialize physical transfer and perform initial data transfer.
-        /// This is only called once on initialization
-        /// </summary>
-        /// <returns>Asynchronous task</returns>
-        public static bool Connect() => DataTransfer.PerformFullTransfer(false);
 
         /// <summary>
         /// Perform communication with the RepRapFirmware controller

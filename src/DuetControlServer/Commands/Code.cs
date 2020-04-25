@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Linq;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using DuetAPI;
@@ -13,6 +14,7 @@ using DuetControlServer.IPC.Processors;
 using DuetControlServer.Model;
 using DuetControlServer.SPI;
 using Nito.AsyncEx;
+using Job = DuetControlServer.FileExecution.Job;
 
 namespace DuetControlServer.Commands
 {
@@ -121,7 +123,7 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Cancellation token that may be used to cancel this code
         /// </summary>
-        public CancellationToken CancellationToken { get; set; }
+        internal CancellationToken CancellationToken { get; set; }
 
         /// <summary>
         /// Create a task that waits until this code can be executed.
@@ -197,19 +199,20 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Start the next available G/M/T-code and wait until this code may finish
         /// </summary>
-        /// <returns>Asynchronous task</returns>
-        private Task<IDisposable> WaitForFinish()
+        /// <returns>Awaitable disposable</returns>
+        private AwaitableDisposable<IDisposable> WaitForFinish()
         {
-            if (Interception.IsInterceptingConnection(SourceConnection))
-            {
-                return Task.FromResult<IDisposable>(null);
-            }
-
-            AwaitableDisposable<IDisposable> finishTask = _codeFinishLocks[(int)Channel, (int)_codeType].LockAsync(CancellationToken);
             if (!Flags.HasFlag(CodeFlags.Unbuffered))
             {
                 StartNextCode();
             }
+
+            if (Interception.IsInterceptingConnection(SourceConnection))
+            {
+                return new AwaitableDisposable<IDisposable>(Task.FromResult<IDisposable>(null));
+            }
+
+            AwaitableDisposable<IDisposable> finishTask = (Macro == null) ? _codeFinishLocks[(int)Channel, (int)_codeType].LockAsync(CancellationToken) : Macro.WaitForCodeFinish();
             return finishTask;
         }
         #endregion
@@ -250,13 +253,13 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Indicates if this code is supposed to deal with a message box awaiting acknowledgement
         /// </summary>
-        public bool IsForAcknowledgement { get => _codeType == InternalCodeType.Acknowledgement; }
+        internal bool IsForAcknowledgement { get => _codeType == InternalCodeType.Acknowledgement; }
 
         /// <summary>
         /// This indicates if this code is cancelling a print.
         /// FIXME Remove this again when the SBC interface has got its own task in RRF
         /// </summary>
-        public bool CancellingPrint { get; set; }
+        internal bool CancellingPrint { get; set; }
 
         /// <summary>
         /// Run an arbitrary G/M/T-code and wait for it to finish
@@ -274,10 +277,9 @@ namespace DuetControlServer.Commands
                         _codeStartLock = await task;
                         return await ExecuteInternally();
                     }
-                    catch
+                    finally
                     {
                         IsExecuted = true;
-                        throw;
                     }
                 }, TaskContinuationOptions.RunContinuationsAsynchronously)
                 .Unwrap();
@@ -289,22 +291,22 @@ namespace DuetControlServer.Commands
         /// <summary>
         /// Indicates whether the code has been internally processed
         /// </summary>
-        public bool InternallyProcessed;
+        internal bool InternallyProcessed { get; set; }
 
         /// <summary>
         /// File that started this code
         /// </summary>
-        public Files.CodeFile File;
+        internal Files.CodeFile File { get; set; }
 
         /// <summary>
         /// Macro that started this code or null
         /// </summary>
-        public Macro Macro;
+        internal Macro Macro { get; set; }
 
         /// <summary>
         /// Indicates if this code has been resolved by an interceptor
         /// </summary>
-        public bool ResolvedByInterceptor;
+        internal bool ResolvedByInterceptor { get; private set; }
 
         /// <summary>
         /// Execute the given code internally
@@ -361,11 +363,30 @@ namespace DuetControlServer.Commands
                     throw;
                 }
             }
+            catch (Exception e) when (!(e is OperationCanceledException))
+            {
+                // Cancel the running file and then start the next code if an exception has occurred
+                if (Macro != null)
+                {
+                    using (await Macro.LockAsync())
+                    {
+                        await Macro.Abort();
+                    }
+                }
+                else if (Channel == CodeChannel.File)
+                {
+                    using (await Job.LockAsync())
+                    {
+                        await Job.Abort();
+                    }
+                }
+                StartNextCode();
+                throw;
+            }
             finally
             {
-                // Make sure the next code is started no matter what happened before
+                // Start the next (unbuffered or unsupported) code if everything went well
                 StartNextCode();
-                IsExecuted = true;
             }
             return Result;
         }
@@ -379,6 +400,7 @@ namespace DuetControlServer.Commands
             // Attempt to process the code internally first
             if (!InternallyProcessed && await ProcessInternally())
             {
+                _logger.Debug("Waiting for finish of {0}", this);
                 using (await WaitForFinish())
                 {
                     await CodeExecuted();
@@ -389,56 +411,35 @@ namespace DuetControlServer.Commands
             // Comments are resolved in DCS but they may be interpreted by third-party plugins
             if (Keyword == KeywordType.None && Type == CodeType.Comment)
             {
-                Result = new CodeResult();
+                _logger.Debug("Waiting for finish of {0}", this);
                 using (await WaitForFinish())
                 {
+                    Result = new CodeResult();
                     await CodeExecuted();
                 }
                 return;
             }
 
-            // Cancel this code if it came from a file and if it was processed while the print was being paused.
-            // If that is not the case, let RepRapFirmware process this code
-            Task<CodeResult> rrfTask;
-            if (Channel == CodeChannel.File)
-            {
-                using (await FileExecution.Job.LockAsync())
-                {
-                    if (FileExecution.Job.IsPaused)
-                    {
-                        throw new OperationCanceledException();
-                    }
-                    rrfTask = Interface.ProcessCode(this);
-                }
-            }
-            else
-            {
-                rrfTask = Interface.ProcessCode(this);
-            }
+            // Enqueue this code for further processing in RepRapFirmware
+            FirmwareTCS = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await Interface.ProcessCode(this);
 
-            // Start the next code if applicable to buffer codes in RRF for greater throughput
-            if (!Flags.HasFlag(CodeFlags.Unbuffered))
-            {
-                StartNextCode();
-            }
-
+            // Wait for the code to be processed by RepRapFirmware
             try
             {
-                // Wait for the code to be processed by RepRapFirmware
-                Result = await rrfTask;
+                _logger.Debug("Waiting for finish of {0}", this);
                 using (await WaitForFinish())
                 {
+                    await FirmwareTask;
                     await CodeExecuted();
                 }
             }
-            catch (OperationCanceledException oce)
+            catch (OperationCanceledException)
             {
-                _logger.Trace(oce, "Code {0} cancelled", this);
-
                 // Cancelling a code clears the result
-                Result = null;
                 using (await WaitForFinish())
                 {
+                    Result = null;
                     await CodeExecuted();
                 }
                 throw;
@@ -535,12 +536,27 @@ namespace DuetControlServer.Commands
         }
 
         /// <summary>
-        /// Indicates if the code has been finished
+        /// TCS used by the SPI subsystem to flag when the code has been cancelled/caused an error/finished
         /// </summary>
-        public bool IsExecuted
+        internal TaskCompletionSource<object> FirmwareTCS { get; private set; }
+
+        /// <summary>
+        /// Task to complete when the code has finished
+        /// </summary>
+        internal Task FirmwareTask { get => FirmwareTCS.Task; }
+
+        /// <summary>
+        /// Size of this code in binary representation
+        /// </summary>
+        internal int BinarySize { get; set; }
+
+        /// <summary>
+        /// Indicates if the code has been fully executed (including the Executed interceptor if applicable)
+        /// </summary>
+        internal bool IsExecuted
         {
             get => _isExecuted;
-            set => _isExecuted = value;
+            private set => _isExecuted = value;
         }
         private volatile bool _isExecuted;
 

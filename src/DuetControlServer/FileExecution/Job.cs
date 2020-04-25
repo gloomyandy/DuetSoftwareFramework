@@ -277,28 +277,17 @@ namespace DuetControlServer.FileExecution
                                 // Code has been cancelled, don't log this. In the future this may terminate the job file
                                 // Note this can happen as well when the file being printed is exchanged
                             }
+                            catch (CodeParserException cpe)
+                            {
+                                await Utility.Logger.LogOutput(MessageType.Error, cpe.Message);
+                            }
                             catch (AggregateException ae)
                             {
-
                                 await Utility.Logger.LogOutput(MessageType.Error, $"{code.ToShortString()} has thrown an exception: [{ae.InnerException.GetType().Name}] {ae.InnerException.Message}");
-                                _logger.Error(ae);
-
-                                using (await _lock.LockAsync(Program.CancellationToken))
-                                {
-                                    await Abort();
-                                    break;
-                                }
                             }
                             catch (Exception e)
                             {
                                 await Utility.Logger.LogOutput(MessageType.Error, $"{code.ToShortString()} has thrown an exception: [{e.GetType().Name}] {e.Message}");
-                                _logger.Error(e);
-
-                                using (await _lock.LockAsync(Program.CancellationToken))
-                                {
-                                    await Abort();
-                                    break;
-                                }
                             }
                         }
                         else

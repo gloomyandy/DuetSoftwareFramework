@@ -141,6 +141,12 @@ namespace DuetControlServer.Model
                                     Provider.Get.UpdateFromFirmwareModel(string.Empty, result);
                                 }
 
+                                // Request limits if no sequence numbers have been set yet
+                                if (_lastSeqs.Count == 0)
+                                {
+                                    SPI.Interface.RequestObjectModel("limits", "d99vn");
+                                }
+
                                 // Request object model updates wherever needed
                                 bool objectModelSynchronized = true;
                                 foreach (JsonProperty seqProperty in result.GetProperty("seqs").EnumerateObject())
@@ -276,6 +282,7 @@ namespace DuetControlServer.Model
             using (Provider.AccessReadWrite())
             {
                 Provider.Get.Boards.Clear();
+                Provider.Get.Move.Compensation.File = null;
                 if (Provider.Get.State.Status != MachineStatus.Halted && Provider.Get.State.Status != MachineStatus.Updating)
                 {
                     Provider.Get.State.Status = MachineStatus.Off;

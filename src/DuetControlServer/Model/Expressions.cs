@@ -230,11 +230,16 @@ namespace DuetControlServer.Model
             {
                 if (code.Parameters[i].IsExpression)
                 {
-                    string trimmedExpression = code.Parameters[i].ToString().Trim();
+                    string trimmedExpression = ((string)code.Parameters[i]).Trim();
                     try
                     {
                         string parameterValue = await EvaluateExpression(code, trimmedExpression, replaceOnlyLinuxFields, true);
-                        code.Parameters[i] = new CodeParameter(code.Parameters[i].Letter, parameterValue, true);
+                        if (!parameterValue.StartsWith('{') && !parameterValue.EndsWith('}'))
+                        {
+                            // Encapsulate even fully expanded parameters so that plugins and RRF know it was an expression
+                            parameterValue = '{' + parameterValue + '}';
+                        }
+                        code.Parameters[i] = new CodeParameter(code.Parameters[i].Letter, parameterValue);
                     }
                     catch (CodeParserException cpe)
                     {
@@ -404,13 +409,13 @@ namespace DuetControlServer.Model
                         {
                             subFilter = subExpression.Substring(1);
                         }
-                        if (Filter.GetSpecific(subFilter, onlyLinuxFields, out object linuxField))
+                        if (Filter.GetSpecific(subFilter, true, out object linuxField))
                         {
-                            string subResult = ObjectToString(linuxField, wantsCount, false, code);
                             if (subExpression == expression)
                             {
-                                return subResult;
+                                return ObjectToString(linuxField, wantsCount, encodeResult, code);
                             }
+                            string subResult = ObjectToString(linuxField, wantsCount, true, code);
                             result.Append(subResult);
                         }
                         else
@@ -466,7 +471,7 @@ namespace DuetControlServer.Model
             {
                 finalFilter = finalExpression.Substring(1);
             }
-            if (Filter.GetSpecific(finalFilter, onlyLinuxFields, out object finalLinuxField))
+            if (Filter.GetSpecific(finalFilter, true, out object finalLinuxField))
             {
                 return ObjectToString(finalLinuxField, wantsFinalCount, encodeResult, code);
             }
