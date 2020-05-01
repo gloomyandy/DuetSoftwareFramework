@@ -1,6 +1,45 @@
 Summary of important changes in recent versions
 ===============================================
 
+Version 2.1.3
+==============
+
+Compatible files:
+- RepRapFirmware 3.01-RC11
+- DuetWebControl 2.1.6
+
+Changed behaviour:
+- Warning message is shown in the DCS log when API clients with an old version number connect
+
+Known issues:
+- Print/Simulation times are not written to G-code files
+- Comments for object cancellation detection are not parsed (work-around is to use M486 directly)
+- Codes with invalid expressions may not instantly terminate a macro or job file
+
+Bug fixes:
+- Unchanged arrays could be reported in Patch subscription mode
+- Initial query in Patch mode was not working
+- Web server did not clear HTTP endpoints under certain circumstances
+- echo expressions were not parsed correctly if strings contained commas
+- Changing the system time just before a controller reset could lead to an abnormal program termination
+
+Version 2.1.2
+==============
+
+Compatible files:
+- RepRapFirmware 3.01-RC10
+- DuetWebControl 2.1.5
+
+Known issues:
+- Print/Simulation times are not written to G-code files
+- Comments for object cancellation detection are not parsed (work-around is to use M486 directly)
+- Codes with invalid expressions may not instantly terminate a macro or job file
+
+Bug fixes:
+- Leading G53 wasn't added to string representations of parsed codes
+- Starting DCS with the fifo CPU scheduler via systemd could lead to maximum CPU usage
+- Some nullable RRF OM fields were not declared as such in the DSF OM
+
 Version 2.1.1
 ==============
 

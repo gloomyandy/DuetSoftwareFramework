@@ -6,7 +6,7 @@
     public sealed class Fan : ModelObject
     {
         /// <summary>
-        /// Value of this fan (0..1)
+        /// Value of this fan (0..1 or -1 if unknown)
         /// </summary>
         public float ActualValue
         {

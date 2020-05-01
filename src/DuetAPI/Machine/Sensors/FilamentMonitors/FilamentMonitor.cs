@@ -21,16 +21,6 @@ namespace DuetAPI.Machine
         private bool _enabled;
 
         /// <summary>
-        /// Indicates if a filament is present
-        /// </summary>
-        public bool? FilamentPresent
-        {
-            get => _filamentPresent;
-			set => SetPropertyValue(ref _filamentPresent, value);
-        }
-        private bool? _filamentPresent;
-
-        /// <summary>
         /// Type of this filament monitor
         /// </summary>
         public FilamentMonitorType Type
@@ -52,6 +42,7 @@ namespace DuetAPI.Machine
                 FilamentMonitorType.Laser => typeof(LaserFilamentMonitor),
                 FilamentMonitorType.Pulsed => typeof(PulsedFilamentMonitor),
                 FilamentMonitorType.RotatingMagnet => typeof(RotatingMagnetFilamentMonitor),
+                FilamentMonitorType.Simple => typeof(SimpleFilamentMonitor),
                 _ => typeof(FilamentMonitor)
             };
         }
@@ -77,12 +68,10 @@ namespace DuetAPI.Machine
                 if (GetType() != requiredType)
                 {
                     FilamentMonitor newInstance = (FilamentMonitor)Activator.CreateInstance(requiredType);
-                    newInstance.UpdateFromJson(jsonElement);
-                    return newInstance;
+                    return newInstance.UpdateFromJson(jsonElement);
                 }
             }
-            base.UpdateFromJson(jsonElement, ignoreSbcProperties);
-            return this;
+            return base.UpdateFromJson(jsonElement, ignoreSbcProperties);
         }
     }
 }
