@@ -11,12 +11,9 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
-using System.Reflection.Metadata.Ecma335;
 using System.Text;
-using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Code = DuetControlServer.Commands.Code;
-using Job = DuetControlServer.FileExecution.Job;
 
 namespace DuetControlServer.SPI.Channel
 {
@@ -552,12 +549,29 @@ namespace DuetControlServer.SPI.Channel
         }
 
         /// <summary>
+        /// Resolve pending comment codes
+        /// </summary>
+        private void ResolveCommentCodes()
+        {
+            while (BufferedCodes.Count > 0 && BufferedCodes[0].Type == CodeType.Comment)
+            {
+                BufferedCodes[0].Result = new CodeResult();
+                BufferedCodes[0].FirmwareTCS.SetResult(null);
+                BytesBuffered -= BufferedCodes[0].BinarySize;
+                BufferedCodes.RemoveAt(0);
+            }
+        }
+
+        /// <summary>
         /// Process pending requests on this channel
         /// </summary>
         /// <returns>If anything more can be done on this channel</returns>
         public async Task<bool> Run()
         {
-            // 1. Lock/Unlock requests
+            // 1. Whole line comments
+            ResolveCommentCodes();
+
+            // 2. Lock/Unlock requests
             if (CurrentState.LockRequests.TryPeek(out LockRequest lockRequest))
             {
                 if (lockRequest.IsLockRequest)
@@ -575,7 +589,7 @@ namespace DuetControlServer.SPI.Channel
                 return false;
             }
 
-            // 2. Suspended codes being resumed (may include priority and macro codes)
+            // 3. Suspended codes being resumed (may include priority and macro codes)
             if (CurrentState.SuspendedCodes.TryPeek(out Code suspendedCode))
             {
                 if (BufferCode(suspendedCode))
@@ -587,7 +601,7 @@ namespace DuetControlServer.SPI.Channel
                 return false;
             }
 
-            // 3. Priority codes
+            // 4. Priority codes
             if (PriorityCodes.TryPeek(out Code queuedCode))
             {
                 if (BufferCode(queuedCode))
@@ -598,7 +612,7 @@ namespace DuetControlServer.SPI.Channel
                 return false;
             }
 
-            // 4. Macro files
+            // 5. Macro files
             if (CurrentState.Macro != null)
             {
                 using (await CurrentState.Macro.LockAsync())
@@ -614,7 +628,7 @@ namespace DuetControlServer.SPI.Channel
                 }
             }
 
-            // 5. Pending codes
+            // 6. Pending codes
             if (CurrentState.PendingCodes.TryPeek(out queuedCode))
             {
                 if (BufferCode(queuedCode))
@@ -625,7 +639,7 @@ namespace DuetControlServer.SPI.Channel
                 return false;
             }
 
-            // 6. Flush requests
+            // 7. Flush requests
             if (BufferedCodes.Count == 0 && CurrentState.FlushRequests.TryDequeue(out TaskCompletionSource<bool> flushRequest))
             {
                 flushRequest.SetResult(true);
@@ -684,10 +698,12 @@ namespace DuetControlServer.SPI.Channel
                     catch (AggregateException ae)
                     {
                         await Logger.LogOutput(MessageType.Error, $"Failed to execute {code} from firmware: [{ae.InnerException.GetType().Name}] {ae.InnerException.Message}");
+                        _logger.Warn(ae);
                     }
                     catch (Exception e)
                     {
                         await Logger.LogOutput(MessageType.Error, $"Failed to execute {code} from firmware: [{e.GetType().Name}] {e.Message}");
+                        _logger.Warn(e);
                     }
                 }, TaskContinuationOptions.RunContinuationsAsynchronously);
             }
@@ -745,6 +761,9 @@ namespace DuetControlServer.SPI.Channel
         /// <returns>Whether the reply could be processed</returns>
         public async Task<bool> HandleReply(MessageTypeFlags flags, string reply)
         {
+            // Replies are not meant for comment codes, resolve them separately
+            ResolveCommentCodes();
+
             // Deal with codes being executed
             if (BufferedCodes.Count > 0)
             {
@@ -964,15 +983,27 @@ namespace DuetControlServer.SPI.Channel
             }
 
             // FIXME Check if the actual macro filename has to be adjusted - will become obsolete when RRF gets its own task for the Linux interface
-            if (startCode != null)
+            if (startCode != null && startCode.CancellingPrint)
             {
-                if ((fileName == "stop.g" || fileName == "sleep.g") && startCode.CancellingPrint)
+                string cancelFile = await FilePath.ToPhysicalAsync("cancel.g", FileDirectory.System);
+                if (File.Exists(cancelFile))
                 {
-                    string cancelFile = await FilePath.ToPhysicalAsync("cancel.g", FileDirectory.System);
-                    if (File.Exists(cancelFile))
+                    fileName = "cancel.g";
+                }
+                else if (startCode.MajorNumber == 0)
+                {
+                    string stopFile = await FilePath.ToPhysicalAsync("stop.g", FileDirectory.System);
+                    if (File.Exists(stopFile))
                     {
-                        // Execute cancel.g instead of stop.g if it exists
-                        fileName = "cancel.g";
+                        fileName = "stop.g";
+                    }
+                }
+                else if (startCode.MajorNumber == 1)
+                {
+                    string sleepFile = await FilePath.ToPhysicalAsync("sleep.g", FileDirectory.System);
+                    if (File.Exists(sleepFile))
+                    {
+                        fileName = "sleep.g";
                     }
                 }
             }
@@ -1000,6 +1031,7 @@ namespace DuetControlServer.SPI.Channel
                     if (!fromCode || BufferedCodes.Count == 0 || BufferedCodes[0].Type != CodeType.MCode || BufferedCodes[0].MajorNumber != 98)
                     {
                         // M98 outputs its own warning message via RRF
+                        Interface.SendMessage((MessageTypeFlags)(MessageTypeFlags.GenericMessage | MessageTypeFlags.ErrorMessageFlag), $"Macro file {fileName} not found");
                         await Logger.LogOutput(MessageType.Error, $"Macro file {fileName} not found");
                     }
                 }

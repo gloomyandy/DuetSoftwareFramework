@@ -18,6 +18,9 @@ namespace DuetAPI.Commands
         /// <summary>
         /// Letter of the code parameter (e.g. P in M106 P3)
         /// </summary>
+        /// <remarks>
+        /// If this is an unprecedented parameter without a letter, '@' is used
+        /// </remarks>
         public char Letter { get; }
 
         /// <summary>
@@ -594,7 +597,7 @@ namespace DuetAPI.Commands
         {
             if (reader.TokenType == JsonTokenType.StartObject)
             {
-                char letter = '\0';
+                char letter = '@';
                 string propertyName = string.Empty, value = string.Empty;
                 bool isString = false, isDriverId = false;
 

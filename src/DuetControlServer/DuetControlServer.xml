@@ -1710,6 +1710,13 @@
             Class providing functions for expression testing and evaluation
             </summary>
         </member>
+        <member name="M:DuetControlServer.Model.Expressions.SplitExpression(System.String)">
+            <summary>
+            Split an echo expression separated by commas
+            </summary>
+            <param name="expression">Expression to spli</param>
+            <returns>Expression items</returns>
+        </member>
         <member name="M:DuetControlServer.Model.Expressions.ContainsLinuxFields(DuetControlServer.Commands.Code)">
             <summary>
             Checks if the given code contains any Linux object model fields
@@ -2807,6 +2814,11 @@
             Called when a resource has been locked
             </summary>
         </member>
+        <member name="M:DuetControlServer.SPI.Channel.Processor.ResolveCommentCodes">
+            <summary>
+            Resolve pending comment codes
+            </summary>
+        </member>
         <member name="M:DuetControlServer.SPI.Channel.Processor.Run">
             <summary>
             Process pending requests on this channel
@@ -3872,6 +3884,11 @@
         <member name="F:DuetControlServer.SPI.Communication.Shared.MessageTypeFlags.DaemonMessage">
             <summary>
             A message that is to be sent to a daemon processor
+            </summary>
+        </member>
+        <member name="F:DuetControlServer.SPI.Communication.Shared.MessageTypeFlags.Aux2Message">
+            <summary>
+            A message that is to be sent to the second UART port
             </summary>
         </member>
         <member name="F:DuetControlServer.SPI.Communication.Shared.MessageTypeFlags.AutoPauseMessage">
