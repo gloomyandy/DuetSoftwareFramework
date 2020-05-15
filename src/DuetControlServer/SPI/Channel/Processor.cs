@@ -12,6 +12,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Code = DuetControlServer.Commands.Code;
 
@@ -195,9 +196,22 @@ namespace DuetControlServer.SPI.Channel
         /// Write channel diagnostics to the given string builder
         /// </summary>
         /// <param name="builder">Target to write to</param>
-        public void Diagnostics(StringBuilder builder)
+        /// <returns>Asynchronous task</returns>
+        public async Task Diagnostics(StringBuilder builder)
         {
             StringBuilder channelDiagostics = new StringBuilder();
+
+            using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(Program.CancellationToken);
+            IDisposable lockObject = null;
+            try
+            {
+                cts.CancelAfter(2000);
+                lockObject = await _lock.LockAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                channelDiagostics.AppendLine($"Failed to lock {Channel} processor within 2 seconds");
+            }
 
             foreach (Code bufferedCode in BufferedCodes)
             {
@@ -251,6 +265,7 @@ namespace DuetControlServer.SPI.Channel
                 builder.AppendLine($"{Channel}:");
                 builder.Append(channelDiagostics);
             }
+            lockObject?.Dispose();
         }
 
         /// <summary>
@@ -947,6 +962,9 @@ namespace DuetControlServer.SPI.Channel
         /// <returns>Asynchronous task</returns>
         public async Task DoMacroFile(string fileName, bool reportMissing, bool fromCode)
         {
+            // Macro requests are not meant for comment codes, resolve them separately
+            ResolveCommentCodes();
+
             // Figure out which code started the macro file
             Code startCode = null;
             if (fromCode)
@@ -1028,12 +1046,8 @@ namespace DuetControlServer.SPI.Channel
                 }
                 else if (reportMissing)
                 {
-                    if (!fromCode || BufferedCodes.Count == 0 || BufferedCodes[0].Type != CodeType.MCode || BufferedCodes[0].MajorNumber != 98)
-                    {
-                        // M98 outputs its own warning message via RRF
-                        Interface.SendMessage((MessageTypeFlags)(MessageTypeFlags.GenericMessage | MessageTypeFlags.ErrorMessageFlag), $"Macro file {fileName} not found");
-                        await Logger.LogOutput(MessageType.Error, $"Macro file {fileName} not found");
-                    }
+                    // Send a warning message back to RRF
+                    Interface.SendMessage(MessageTypeFlags.GenericMessage | MessageTypeFlags.WarningMessageFlag, $"Macro file {fileName} not found\n");
                 }
                 else if (FilePath.DeployProbePattern.IsMatch(fileName))
                 {

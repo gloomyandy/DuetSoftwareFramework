@@ -399,29 +399,24 @@ namespace DuetAPI.Commands
                             {
                                 AddParameter(result, char.ToUpperInvariant(letter), value, false, false);
                             }
-                            else
-                            {
-                                throw new CodeParserException($"Duplicate {letter} parameter", result);
-                            }
-                        }
-                        else if (letter == '\0' || result.Parameter(letter) == null)
-                        {
-                            if (unprecedentedParameter)
-                            {
-                                if (letter == '\0')
-                                {
-                                    letter = '@';
-                                }
-                            }
-                            else
-                            {
-                                letter = char.ToUpperInvariant(letter);
-                            }
-                            AddParameter(result, letter, value, wasQuoted, unprecedentedParameter || isNumericParameter || wasExpression);
+                            // Ignore duplicate parameters
                         }
                         else
                         {
-                            throw new CodeParserException($"Duplicate {(letter == '\0' ? "unprecedented" : letter.ToString())} parameter", result);
+                            if (letter == '\0')
+                            {
+                                letter = '@';
+                            }
+                            else if (!unprecedentedParameter)
+                            {
+                                letter = char.ToUpperInvariant(letter);
+                            }
+
+                            if (result.Parameter(letter) == null)
+                            {
+                                AddParameter(result, letter, value, wasQuoted, unprecedentedParameter || isNumericParameter || wasExpression);
+                            }
+                            // Ignore duplicate parameters
                         }
 
                         letter = '\0';

@@ -548,11 +548,6 @@ namespace DuetControlServer.SPI
                         }
 
                         _iapStream = _firmwareStream = null;
-                        if (Settings.UpdateOnly)
-                        {
-                            Program.CancelSource.Cancel();
-                            return;
-                        }
                     }
                 }
 
@@ -724,12 +719,15 @@ namespace DuetControlServer.SPI
                 _channels.ResetBlockedChannels();
 
                 // Wait a moment unless instructions are being sent rapidly to RRF
-                bool isSimulating;
+                bool skipDelay;
                 using (await Model.Provider.AccessReadOnlyAsync())
                 {
-                    isSimulating = Model.Provider.Get.State.Status == MachineStatus.Simulating;
+                    skipDelay = Model.Provider.Get.State.Status == MachineStatus.Updating;
                 }
-                await Task.Delay(Settings.SpiPollDelay, Program.CancellationToken);
+                if (!skipDelay)
+                {
+                    await Task.Delay(Settings.SpiPollDelay, Program.CancellationToken);
+                }
             }
             while (true);
         }
@@ -1009,7 +1007,7 @@ namespace DuetControlServer.SPI
 
             try
             {
-                string filePath = await FilePath.ToPhysicalAsync(filename, FileDirectory.System);
+                string filePath = await FilePath.ToPhysicalAsync(filename, filename.EndsWith(".bin") ? FileDirectory.Firmware : FileDirectory.System);
                 using FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read)
                 {
                     Position = offset

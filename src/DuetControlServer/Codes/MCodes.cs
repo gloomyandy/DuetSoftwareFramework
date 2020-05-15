@@ -7,7 +7,7 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -224,6 +224,10 @@ namespace DuetControlServer.Codes
                             CodeParameter sParam = code.Parameter('S');
                             if (sParam != null)
                             {
+                                if (sParam < 0L || sParam > FileExecution.Job.FileLength)
+                                {
+                                    return new CodeResult(MessageType.Error, "Position is out of range");
+                                }
                                 await FileExecution.Job.SetFilePosition(sParam);
                             }
                         }
@@ -676,17 +680,26 @@ namespace DuetControlServer.Codes
                 case 505:
                     if (await SPI.Interface.Flush(code))
                     {
-                        string directory = code.Parameter('P'), physicalDirectory = await FilePath.ToPhysicalAsync(directory, "sys");
-                        if (Directory.Exists(physicalDirectory))
+                        string directory = code.Parameter('P');
+                        if (!string.IsNullOrEmpty(directory))
                         {
-                            string virtualDirectory = await FilePath.ToVirtualAsync(physicalDirectory);
-                            using (await Model.Provider.AccessReadWriteAsync())
+                            string physicalDirectory = await FilePath.ToPhysicalAsync(directory, "sys");
+                            if (Directory.Exists(physicalDirectory))
                             {
-                                Model.Provider.Get.Directories.System = virtualDirectory;
+                                string virtualDirectory = await FilePath.ToVirtualAsync(physicalDirectory);
+                                using (await Model.Provider.AccessReadWriteAsync())
+                                {
+                                    Model.Provider.Get.Directories.System = virtualDirectory;
+                                }
+                                return new CodeResult();
                             }
-                            return new CodeResult();
+                            return new CodeResult(MessageType.Error, "Directory not found");
                         }
-                        return new CodeResult(MessageType.Error, "Directory not found");
+
+                        using (await Model.Provider.AccessReadOnlyAsync())
+                        {
+                            return new CodeResult(MessageType.Success, $"Sys file path is {Model.Provider.Get.Directories.System}");
+                        }
                     }
                     throw new OperationCanceledException();
 
@@ -971,9 +984,9 @@ namespace DuetControlServer.Codes
         private static async Task Diagnostics(CodeResult result)
         {
             StringBuilder builder = new StringBuilder();
-
             builder.AppendLine("=== Duet Control Server ===");
-            builder.AppendLine($"Duet Control Server v{Assembly.GetExecutingAssembly().GetName().Version}");
+            builder.AppendLine($"Duet Control Server v{Program.Version}");
+
             await SPI.Interface.Diagnostics(builder);
             SPI.DataTransfer.Diagnostics(builder);
             await FileExecution.Job.Diagnostics(builder);
